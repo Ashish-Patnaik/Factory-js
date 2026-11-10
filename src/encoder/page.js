@@ -43,15 +43,20 @@ function sampleFromCanvas(ctx, canvas, tSec, fps) {
 // ---------------------------------------------------------------------------
 // Small helpers
 // ---------------------------------------------------------------------------
-const QUALITY_LADDER = [ // CRF-equivalent -> bitrate share of a 24 Mbps 1080p30 ceiling
-  { max: 14, per: 0.42 }, { max: 18, per: 0.33 }, { max: 22, per: 0.25 },
+// The 14 Mbps ceiling puts quality 18 at ~4.5 Mbps for 1080p30 - inside Meta's
+// recommended 3-6 Mbps ingest range for 1080p30 (and far under the 25 Mbps VBR reel
+// cap). Halves the file size vs the old 24 Mbps ceiling (~8 Mbps), so uploads are
+// faster and far less likely to hit rupload timeouts on CI; screen-content frames
+// keep looking crisp (the pages we film are mostly flat color + text).
+const QUALITY_LADDER = [ // CRF-equivalent -> bitrate share of a 14 Mbps 1080p30 ceiling
+  { max: 14, per: 0.42 }, { max: 18, per: 0.32 }, { max: 22, per: 0.25 },
   { max: 28, per: 0.19 }, { max: 34, per: 0.12 }, { max: 52, per: 0.08 },
 ];
 
 function crfToBitrate(quality, w, h, fps) {
   const unit = (w * h) / (1920 * 1080);
   const per = QUALITY_LADDER.find((q) => quality <= q.max).per;
-  return Math.round(Math.min(24e6, Math.max(600e3, 24e6 * unit * per * (fps / 30))));
+  return Math.round(Math.min(14e6, Math.max(600e3, 14e6 * unit * per * (fps / 30))));
 }
 
 export function parseBitrate(str) {
@@ -206,7 +211,8 @@ class Session {
     this.output.addVideoTrack(this.vSrc, { frameRate: fps });
     this.bitrate = rate;
     // the audio track must exist before output.start(); samples arrive later
-    this.aSrc = new AudioBufferSource({ codec: 'aac', bitrate: 192000 });
+    // (128 kbps = Meta's documented Reels audio bitrate; was 192 kbps)
+    this.aSrc = new AudioBufferSource({ codec: 'aac', bitrate: 128000 });
     this.output.addAudioTrack(this.aSrc);
   }
 
@@ -240,10 +246,16 @@ class Session {
       out[delay + i0] += src[i] * (1 - frac);
       out[delay + i0 + 1] += src[i] * frac;
     }
-    const buf = new AudioBuffer({ numberOfChannels: 1, length: out.length, sampleRate: OUT });
+    // Stereo output: the IG Graph API reel spec allows 1-2 channels, but Meta's Reels
+    // ingest profile (and the FB Reels Publishing API spec) calls for stereo. Duplicating
+    // the mono narration into both channels costs ~nothing (joint-stereo coding) and
+    // matches the recommended profile. mediabunny derives the encoder channel count from
+    // the buffer (verified in Chromium: 2ch in -> AAC decoderConfig numberOfChannels=2).
+    const buf = new AudioBuffer({ numberOfChannels: 2, length: out.length, sampleRate: OUT });
     // AudioBuffer is ZERO-FILLED on construction - without this copy the muxed AAC track
     // is N seconds of perfect silence (video fine, audio "missing"). A/B-proven.
     buf.getChannelData(0).set(out);
+    buf.getChannelData(1).set(out);
     return buf;
   }
 
@@ -520,7 +532,7 @@ export const api = {
     const rate = bitrate ?? crfToBitrate(quality, width, height, fps);
     const vSrc = new VideoSampleSource({ codec: 'avc', keyFrameInterval: 2, quality: new Quality({ bitrate: rate }), latencyMode: 'quality' });
     out.addVideoTrack(vSrc, { frameRate: fps });
-    const aSrc = new AudioBufferSource({ codec: 'aac', bitrate: 192000 });
+    const aSrc = new AudioBufferSource({ codec: 'aac', bitrate: 128000 });
     out.addAudioTrack(aSrc);
     session.output2 = out;
     session.vSrc2 = vSrc;
