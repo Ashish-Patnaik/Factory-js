@@ -37,9 +37,12 @@ const GRAPH_VERSION = process.env.IG_GRAPH_VERSION ?? 'v23.0';
 const BASE_URL = `https://graph.facebook.com/${GRAPH_VERSION}`;
 const IG_MAX_DURATION = Number(process.env.IG_MAX_DURATION ?? '90');
 export { IG_MAX_DURATION };
-// Chunked resumable upload (Meta's documented protocol for large videos; the offset
-// header makes an interrupted transfer resumable from bytes_transferred). 8 MB matches
-// the YouTube uploader's chunk size - override with IG_CHUNK_SIZE in .env if needed.
+// Resumable upload protocol (Meta docs): ONE request carries the whole file -
+// offset: 0 + file_size: N headers + all N bytes as the body. The endpoint validates
+// bytes_received == file_size - offset per request and answers PartialRequestError
+// ("Partial request (did not match length of file)") otherwise - so fixed-size chunk
+// bodies (the YouTube protocol, NOT this one) can never validate. IG_CHUNK_SIZE is
+// legacy, kept only for the igChunkPlan unit tests.
 const IG_CHUNK_SIZE = Number(process.env.IG_CHUNK_SIZE ?? 8 * 1024 * 1024);
 const IG_UPLOAD_ATTEMPTS = Number(process.env.IG_UPLOAD_ATTEMPTS ?? '3');
 
@@ -398,27 +401,29 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
     const uploadUri = data.uri;
     console.log(`[instagram] container created (attempt ${attempt}/${IG_UPLOAD_ATTEMPTS}): ${containerId}`);
 
-    // Step 2: Chunked resumable upload per Meta's official protocol
+    // Step 2: Resumable upload per Meta's official protocol
     // (developers.facebook.com/documentation/instagram-platform/content-publishing/
-    // resumable-uploads): EVERY request carries Authorization: OAuth + offset + file_size
-    // headers plus the raw bytes for that chunk; the docs define offset as "the first
-    // byte being uploaded", explicitly "useful for large video files". Single-shot PUTs
-    // of ~10-50 MB die inside Meta's ingest layer with "1363008 OIL Error[FILE_NOT_FOUND]"
-    // (the bytes never make it into object storage), so the file goes out in 8 MB chunks
-    // instead. Each body is a Buffer slice, so undici sends an exact Content-Length and
-    // the transferred byte count can never drift from the file_size header (a mismatch is
-    // a documented ProcessingFailedError trigger). Do NOT mix in X-Entity-* headers here
-    // (separate protocol; mixing is what broke earlier attempts in the Python era).
+    // resumable-uploads): ONE request carries the whole file - Authorization: OAuth,
+    // offset: 0, file_size: N headers, body = all N bytes. The endpoint validates
+    // bytes_received == file_size - offset PER REQUEST and answers PartialRequestError
+    // "Partial request (did not match length of file)" otherwise - which is why fixed
+    // 8 MB chunk bodies always stalled at byte 0: an 8 MB body against a 32 MB
+    // file_size can never validate, and Meta's retriable:true flag is a trap (retrying
+    // the same partial body can never succeed). The documented "resumable" part means
+    // RESUME: if a transfer is interrupted, query bytes_transferred and re-send ONLY
+    // the remaining bytes with that offset (still exactly file_size - offset). Each
+    // body is a Buffer slice, so undici sends an exact Content-Length. Do NOT mix in
+    // X-Entity-* headers here (separate protocol; mixing broke the Python-era attempts).
     const fileBuf = fs.readFileSync(videoPath);
     const fileSize = fileBuf.length;
-    const chunkCount = Math.max(1, Math.ceil(fileSize / IG_CHUNK_SIZE));
-    console.log(`[instagram] uploading ${videoPath} (${(fileSize / 1e6).toFixed(1)} MB) as ${chunkCount} chunk(s) of ${(IG_CHUNK_SIZE / 1e6).toFixed(0)} MB...`);
+    console.log(`[instagram] uploading ${videoPath} (${(fileSize / 1e6).toFixed(1)} MB) as one resumable request (auto-resume from bytes_transferred on interruption)`);
     let offset = 0;
     let resumes = 0;
     while (offset < fileSize) {
-      const chunk = fileBuf.subarray(offset, Math.min(offset + IG_CHUNK_SIZE, fileSize));
+      const body = fileBuf.subarray(offset); // ALL remaining bytes: exactly file_size - offset
       let chunkOk = false;
       let lastChunkErr = null;
+      let authErr = null;
       for (let chunkTry = 1; chunkTry <= 3 && !chunkOk; chunkTry++) {
         let parsed;
         try {
@@ -429,7 +434,7 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
               offset: String(offset),
               file_size: String(fileSize),
             },
-            body: chunk,
+            body,
             signal: AbortSignal.timeout(600000),
           });
           parsed = parseRuploadResult(await r.json().catch(() => null), r.status);
@@ -437,24 +442,25 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
           parsed = { ok: false, type: 'NetworkError', message: String(e?.message ?? e), nested: '', retriable: true, authFail: false };
         }
         if (parsed.ok) { chunkOk = true; break; }
-        // A bad or expired token never fixes itself, so fail fast with a readable message
-        // instead of burning the remaining attempts (the docs' own failure sample shows
-        // ProcessingFailedError can WRAP "unauthorized user request").
         if (parsed.authFail) {
-          throw new Error('Instagram auth rejected (check IG_ACCESS_TOKEN - expired, wrong token type, ' +
+          authErr = new Error('Instagram auth rejected (check IG_ACCESS_TOKEN - expired, wrong token type, ' +
             `or missing instagram_content_publish): ${parsed.nested || parsed.message}`);
+          break;
         }
         lastChunkErr = `${parsed.type || 'unknown'}: ${parsed.message.slice(0, 160)}`;
-        console.log(`[instagram] chunk @${offset} try ${chunkTry}/3 failed (retriable=${parsed.retriable}): ${lastChunkErr}`);
-        if (!parsed.retriable && parsed.type !== 'ProcessingFailedError') break; // hard chunk rejection
-        if (chunkTry < 3) await new Promise((r) => setTimeout(r, 3000 * chunkTry));
+        console.log(`[instagram] rupload @${offset} try ${chunkTry}/3 failed (retriable=${parsed.retriable}): ${lastChunkErr}`);
+        if (!parsed.retriable && parsed.type !== 'ProcessingFailedError') break; // hard rejection
+        if (chunkTry < 3) await new Promise((r2) => setTimeout(r2, 3000 * chunkTry));
       }
+      // A bad or expired token never fixes itself, so fail fast with a readable message
+      // instead of burning the remaining attempts (the docs' own failure sample shows
+      // ProcessingFailedError can WRAP "unauthorized user request").
+      if (authErr) throw authErr;
       if (!chunkOk) {
         // Documented resume path (docs Step 5): ask Meta how many bytes actually landed
-        // and continue from bytes_transferred. If Meta already holds the whole file, the
-        // last chunk's error response was a lie - treat the upload as complete. If Meta
-        // holds LESS than we tried to send, the container is dead -> next attempt gets a
-        // FRESH container.
+        // and re-send only the remainder. If Meta already holds the whole file, the error
+        // response was a lie - treat the transfer as complete. If Meta holds LESS than
+        // our offset, the container is dead -> the next attempt gets a FRESH container.
         let have = 0;
         try {
           const st = await jsonFetch(`${BASE_URL}/${containerId}?fields=video_status&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`);
@@ -465,16 +471,16 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
           break;
         }
         if (have > offset && resumes < 3) {
-          console.log(`[instagram] Meta holds ${have} bytes (> our failed offset ${offset}); resuming from there`);
+          console.log(`[instagram] Meta holds ${have} bytes (> our failed offset ${offset}); resuming with the remaining ${fileSize - have}`);
           offset = have;
           resumes++;
           continue;
         }
-        err = `chunked upload stalled at byte ${offset}/${fileSize}: ${lastChunkErr ?? 'unknown error'}`;
+        err = `resumable upload stalled at byte ${offset}/${fileSize}: ${lastChunkErr ?? 'unknown error'}`;
         break;
       }
-      offset += chunk.length;
-      console.log(`[instagram] uploaded ${offset}/${fileSize} bytes (${Math.floor((offset / fileSize) * 100)}%)`);
+      offset = fileSize;
+      console.log(`[instagram] uploaded ${offset}/${fileSize} bytes (100%)`);
     }
     if (err) {
       console.log(`[instagram] upload attempt ${attempt}/${IG_UPLOAD_ATTEMPTS} failed: ${err}`);
