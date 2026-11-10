@@ -326,7 +326,7 @@ export function parseRuploadResult(data2, httpStatus) {
 async function igProbe(videoPath) {
   const m = await probeMedia(videoPath).catch(() => null);
   if (!m || !m.video) return { path: videoPath, meta: m };
-  const audioDesc = m.audio ? `${m.audio.codec}/${m.audio.sampleRate}Hz` : 'MISSING';
+  const audioDesc = m.audio ? `${m.audio.codec}/${m.audio.sampleRate}Hz/${m.audio.channels ?? '?'}ch` : 'MISSING';
   console.log(`[instagram] probe: ${m.video.codec} ${m.video.width}x${m.video.height} @${m.video.fps.toFixed(2)} fps | ` +
     `audio ${audioDesc} | ${m.duration.toFixed(1)}s, ${(m.size / 1e6).toFixed(1)} MB`);
   return { path: videoPath, meta: m };
@@ -379,7 +379,7 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
   // ("1363008 OIL Error[FILE_NOT_FOUND]" / ProcessingFailedError) - Meta's own forums
   // confirm it is server-side, and the same file often succeeds on a later attempt.
   // So: N attempts, escalating waits, a FRESH container every time, and byte-exact
-  // chunked transfers.
+  // single-stream transfers.
   const waits = [20000, 60000];
   for (let attempt = 1; attempt <= IG_UPLOAD_ATTEMPTS; attempt++) {
     err = null;
@@ -398,7 +398,10 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
     });
     const data = igCheck(created);
     containerId = data.id;
-    const uploadUri = data.uri;
+    // The create response carries the rupload `uri` (ig-user/media resumable upload docs
+    // return { id, uri }); constructing it as a fallback keeps the upload working even if
+    // Meta ever omits the field.
+    const uploadUri = data.uri || `https://rupload.facebook.com/ig-api-upload/${GRAPH_VERSION}/${containerId}`;
     console.log(`[instagram] container created (attempt ${attempt}/${IG_UPLOAD_ATTEMPTS}): ${containerId}`);
 
     // Step 2: Resumable upload per Meta's official protocol
@@ -418,93 +421,111 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
     const fileSize = fileBuf.length;
     console.log(`[instagram] uploading ${videoPath} (${(fileSize / 1e6).toFixed(1)} MB) as one resumable request (auto-resume from bytes_transferred on interruption)`);
     let offset = 0;
+    let sameOffsetTries = 0;
     let resumes = 0;
     while (offset < fileSize) {
       const body = fileBuf.subarray(offset); // ALL remaining bytes: exactly file_size - offset
-      let chunkOk = false;
-      let lastChunkErr = null;
-      let authErr = null;
-      for (let chunkTry = 1; chunkTry <= 3 && !chunkOk; chunkTry++) {
-        let parsed;
-        try {
-          const r = await fetch(uploadUri, {
-            method: 'POST',
-            headers: {
-              Authorization: `OAuth ${IG_ACCESS_TOKEN}`,
-              offset: String(offset),
-              file_size: String(fileSize),
-            },
-            body,
-            signal: AbortSignal.timeout(600000),
-          });
-          parsed = parseRuploadResult(await r.json().catch(() => null), r.status);
-        } catch (e) {
-          parsed = { ok: false, type: 'NetworkError', message: String(e?.message ?? e), nested: '', retriable: true, authFail: false };
-        }
-        if (parsed.ok) { chunkOk = true; break; }
-        if (parsed.authFail) {
-          authErr = new Error('Instagram auth rejected (check IG_ACCESS_TOKEN - expired, wrong token type, ' +
-            `or missing instagram_content_publish): ${parsed.nested || parsed.message}`);
-          break;
-        }
-        lastChunkErr = `${parsed.type || 'unknown'}: ${parsed.message.slice(0, 160)}`;
-        console.log(`[instagram] rupload @${offset} try ${chunkTry}/3 failed (retriable=${parsed.retriable}): ${lastChunkErr}`);
-        if (!parsed.retriable && parsed.type !== 'ProcessingFailedError') break; // hard rejection
-        if (chunkTry < 3) await new Promise((r2) => setTimeout(r2, 3000 * chunkTry));
+      let parsed;
+      try {
+        const r = await fetch(uploadUri, {
+          method: 'POST',
+          headers: {
+            Authorization: `OAuth ${IG_ACCESS_TOKEN}`,
+            offset: String(offset),
+            file_size: String(fileSize),
+            // the content type Meta's rupload guide documents for video uploads
+            'Content-Type': 'application/octet-stream',
+          },
+          body, // Buffer slice -> undici sends an exact Content-Length
+          signal: AbortSignal.timeout(600000),
+        });
+        parsed = parseRuploadResult(await r.json().catch(() => null), r.status);
+      } catch (e) {
+        parsed = { ok: false, type: 'NetworkError', message: String(e?.message ?? e), nested: '', retriable: true, authFail: false };
+      }
+      if (parsed.ok) {
+        offset = fileSize;
+        console.log(`[instagram] uploaded ${offset}/${fileSize} bytes (100%)`);
+        break;
       }
       // A bad or expired token never fixes itself, so fail fast with a readable message
       // instead of burning the remaining attempts (the docs' own failure sample shows
       // ProcessingFailedError can WRAP "unauthorized user request").
-      if (authErr) throw authErr;
-      if (!chunkOk) {
-        // Documented resume path (docs Step 5): ask Meta how many bytes actually landed
-        // and re-send only the remainder. If Meta already holds the whole file, the error
-        // response was a lie - treat the transfer as complete. If Meta holds LESS than
-        // our offset, the container is dead -> the next attempt gets a FRESH container.
-        let have = 0;
-        try {
-          const st = await jsonFetch(`${BASE_URL}/${containerId}?fields=video_status&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`);
-          have = Number(st.data?.video_status?.uploading_phase?.bytes_transferred ?? 0);
-        } catch { /* diagnostics only */ }
-        if (have >= fileSize) {
-          console.log(`[instagram] Meta already holds all ${fileSize} bytes (bytes_transferred=${have}); continuing`);
-          break;
-        }
-        if (have > offset && resumes < 3) {
-          console.log(`[instagram] Meta holds ${have} bytes (> our failed offset ${offset}); resuming with the remaining ${fileSize - have}`);
-          offset = have;
-          resumes++;
-          continue;
-        }
-        err = `resumable upload stalled at byte ${offset}/${fileSize}: ${lastChunkErr ?? 'unknown error'}`;
+      if (parsed.authFail) {
+        throw new Error('Instagram auth rejected (check IG_ACCESS_TOKEN - expired, wrong token type, ' +
+          `or missing instagram_content_publish): ${parsed.nested || parsed.message}`);
+      }
+      const failDesc = `${parsed.type || 'unknown'}: ${parsed.message.slice(0, 160)}`;
+      console.log(`[instagram] rupload @${offset} failed (retriable=${parsed.retriable}): ${failDesc}`);
+
+      // Resume FIRST, retry-at-same-offset second: ask Meta how many bytes actually landed
+      // before spending another full re-send. If Meta already holds the whole file, the
+      // error response was a lie (ProcessingFailedError often arrives after a fully-received
+      // upload) - treat the transfer as complete and let the processing poll sort it out.
+      // If Meta holds LESS than our offset, the container is dead -> next attempt gets a
+      // FRESH container.
+      let have = 0;
+      try {
+        const st = await jsonFetch(`${BASE_URL}/${containerId}?fields=video_status&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`);
+        have = Number(st.data?.video_status?.uploading_phase?.bytes_transferred ?? 0);
+      } catch { /* progress probe is best-effort */ }
+      if (have >= fileSize) {
+        console.log(`[instagram] Meta already holds all ${fileSize} bytes (bytes_transferred=${have}); continuing`);
         break;
       }
-      offset = fileSize;
-      console.log(`[instagram] uploaded ${offset}/${fileSize} bytes (100%)`);
-    }
-    if (err) {
-      console.log(`[instagram] upload attempt ${attempt}/${IG_UPLOAD_ATTEMPTS} failed: ${err}`);
-    } else {
-      console.log('[instagram] upload accepted: all bytes transferred');
-      break; // success - leave the attempt loop and poll processing below
-    }
-    // Best-effort diagnosis: the container's video_status carries Meta's REAL rejection
-    // reason (error code + message + how many bytes actually landed) when the raw rupload
-    // response is just a generic ProcessingFailedError. Makes server-side rejections
-    // actually debuggable.
-    try {
-      const st = await jsonFetch(`${BASE_URL}/${containerId}?fields=status_code,video_status&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`);
-      const vs = st.data?.video_status ?? {};
-      const metaErrs = [
-        ...(vs.uploading_phase?.errors ?? []),
-        ...(vs.processing_phase?.errors ?? []),
-      ].map((e) => `${e.code ?? ''} ${e.message ?? ''}`.trim()).filter(Boolean);
-      const bt = vs.uploading_phase?.bytes_transferred;
-      const xfer = bt != null ? `, bytes_transferred=${bt}` : '';
-      if (metaErrs.length) {
-        console.log(`[instagram] container ${containerId} (${st.data?.status_code ?? '?'}${xfer}): Meta reports: ${metaErrs.join(' | ')}`);
+      if (have > offset && resumes < 5) {
+        console.log(`[instagram] resuming from Meta's bytes_transferred=${have} (remaining ${fileSize - have} bytes)`);
+        offset = have;
+        sameOffsetTries = 0;
+        resumes++;
+        continue;
       }
-    } catch { /* diagnostics only - never mask the upload error */ }
+      sameOffsetTries++;
+      if (sameOffsetTries >= 3) {
+        err = `resumable upload stalled at byte ${offset}/${fileSize}: ${failDesc}`;
+        break;
+      }
+      await new Promise((r2) => setTimeout(r2, 3000 * sameOffsetTries));
+    }
+    if (!err) {
+      // Step 3: Poll processing INSIDE the attempt loop. A failed transcode poisons the
+      // container forever, so an ERROR/EXPIRED verdict must reach the OUTER loop, which
+      // retries with a FRESH container (fresh bytes) - the workaround for Meta's flaky
+      // "OIL FILE_NOT_FOUND" transcodes.
+      let waited = 0;
+      const pollTimeout = 300, pollInterval = 5;
+      let finished = false;
+      while (waited < pollTimeout) {
+        let stData = null;
+        try {
+          stData = (await jsonFetch(`${BASE_URL}/${containerId}?fields=status_code&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`)).data;
+        } catch { /* transient Graph glitches: just poll again */ }
+        const status = stData?.status_code;
+        if (status) console.log(`[instagram] processing status: ${status}`);
+        if (status === 'FINISHED') { finished = true; break; }
+        if (status === 'ERROR' || status === 'EXPIRED') {
+          // Best-effort: the container's video_status carries Meta's REAL rejection reason
+          // (error code + message) when the raw rupload response was just generic.
+          try {
+            const st = await jsonFetch(`${BASE_URL}/${containerId}?fields=video_status&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`);
+            const vs = st.data?.video_status ?? {};
+            const metaErrs = [
+              ...(vs.uploading_phase?.errors ?? []),
+              ...(vs.processing_phase?.errors ?? []),
+            ].map((e) => `${e.code ?? ''} ${e.message ?? ''}`.trim()).filter(Boolean);
+            if (metaErrs.length) console.log(`[instagram] container ${containerId}: Meta reports: ${metaErrs.join(' | ')}`);
+          } catch { /* diagnostics only - never mask the processing error */ }
+          err = `container ${containerId} finished with status ${status}`;
+          break;
+        }
+        await new Promise((r) => setTimeout(r, pollInterval * 1000));
+        waited += pollInterval;
+      }
+      if (finished) break; // ready for Step 4
+      if (!err) err = 'Instagram timed out waiting for video processing';
+    }
+
+    console.log(`[instagram] upload attempt ${attempt}/${IG_UPLOAD_ATTEMPTS} failed: ${err}`);
     if (attempt < IG_UPLOAD_ATTEMPTS) {
       // Transient/processing failure: the next attempt starts with a FRESH container.
       await new Promise((r) => setTimeout(r, waits[attempt - 1] ?? 60000));
@@ -512,26 +533,28 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
   }
   if (err) throw new Error(`Instagram upload failed: ${err}`);
 
-  // Step 3: Wait until ready
-  let waited = 0;
-  const timeout = 600, interval = 5;
-  while (waited < timeout) {
-    const st = igCheck(await jsonFetch(`${BASE_URL}/${containerId}?fields=status_code,status&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`));
-    const status = st.status_code;
-    console.log(`[instagram] processing status: ${status}`);
-    if (status === 'FINISHED') break;
-    if (status === 'ERROR' || status === 'EXPIRED') throw new Error(`Instagram processing failed: ${JSON.stringify(st)}`);
-    await new Promise((r) => setTimeout(r, interval * 1000));
-    waited += interval;
+  // Step 4: Publish the FINISHED container. media_publish can transiently 5xx or claim the
+  // container "is not ready" right after FINISHED - retry instead of dying at the last step.
+  let pub = null;
+  let pubErr = null;
+  for (let pubTry = 1; pubTry <= 3 && !pub; pubTry++) {
+    try {
+      const res = await jsonFetch(`${BASE_URL}/${IG_USER_ID}/media_publish`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        body: new URLSearchParams({ creation_id: containerId, access_token: IG_ACCESS_TOKEN }),
+      });
+      if (res.status === 200 && res.data?.id) pub = res.data;
+      else throw new Error(`Instagram API error (${res.status}): ${JSON.stringify(res.data ?? res.text?.slice(0, 200))}`);
+    } catch (e) {
+      pubErr = e;
+      if (pubTry < 3) {
+        console.log(`[instagram] media_publish try ${pubTry}/3 hit a transient failure, retrying in 5s...`);
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
   }
-  if (waited >= timeout) throw new Error('Instagram timed out waiting for video processing');
-
-  // Step 4: Publish
-  const pub = igCheck(await jsonFetch(`${BASE_URL}/${IG_USER_ID}/media_publish`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({ creation_id: containerId, access_token: IG_ACCESS_TOKEN }),
-  }));
+  if (!pub) throw pubErr ?? new Error('Instagram media_publish failed');
   console.log(`[instagram] published! Media ID: ${pub.id}`);
   return pub.id;
 }
