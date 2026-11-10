@@ -18,3 +18,4 @@ https://huggingface.co/spaces # 36 links, live AI demos — records beautifully
 ### High-volume dev/AI article mills (free)
 https://techcrunch.com/category/artificial-intelligence/ # 61 links
 https://hackernoon.com/ # 100 links
+https://thenewstack.io/
