@@ -27,6 +27,50 @@ export const EXTRACT_LINKS_JS = `() => {
   return out.slice(0, 100);
 }`;
 
+// ---------------------------------------------------------------------------
+// Anti-bot challenge detection (Imperva/Incapsula, Cloudflare, DataDome,
+// PerimeterX/HUMAN, Kasada...). Some sites serve an interstitial like
+// "Performing security verification" instead of content. These cannot be
+// passed programmatically - and must not be filmed either (the renderer would
+// scroll the challenge page into the final video). We detect them and skip:
+// the agent falls through to the next pick/hub instead of scripting garbage.
+// ---------------------------------------------------------------------------
+// STRONG: phrase-level fingerprints, safe to match in a title or the body head.
+const CHALLENGE_STRONG_RE = new RegExp(
+  'performing security verification|verif\\w* you are (?:a )?human|you are not a bot|not a robot|' +
+  'are you a (?:robot|human)|just a moment|attention required|checking your browser|one more step|' +
+  'prove you are human|press & hold|enable javascript and cookies|ddos protection|' +
+  'request (?:was|has been) blocked|access (?:to this (?:page|site|website) )?(?:is )?denied|' +
+  'bot verification|robot check|unsupported browser', 'i');
+// WEAK: vendor/product names - only trusted on a tiny body (a challenge stub), so an
+// article ABOUT Imperva/CAPTCHAs with a real 10k-char page is never misclassified.
+const CHALLENGE_WEAK_RE = /imperva|incapsula|datadome|perimeterx|kasada|captcha|cloudflare/i;
+const CHALLENGE_BODY_MAX = 2500;
+const CHALLENGE_WEAK_BODY_MAX = 1200;
+
+export function looksLikeChallenge(title, text) {
+  const t = String(title ?? '');
+  const body = String(text ?? '');
+  const shortBody = body.length < CHALLENGE_BODY_MAX;
+  const titleHit = CHALLENGE_STRONG_RE.test(t);
+  const bodyHit = shortBody && CHALLENGE_STRONG_RE.test(body.slice(0, 600));
+  // Dedicated interstitials: a challenge-phrase title corroborated by a tiny stub body
+  // (or no body at all). This keeps an article TITLED "One more step toward AGI..." safe.
+  if (titleHit && (bodyHit || body.length < 300)) return true;
+  // Some challenges have a neutral title but the classic phrases in the stub body.
+  if (bodyHit) return true;
+  // Vendor-name evidence only counts on a tiny body, so a real article ABOUT
+  // Imperva/CAPTCHAs (10k+ chars) is never misclassified.
+  if (body.length < CHALLENGE_WEAK_BODY_MAX && CHALLENGE_WEAK_RE.test(`${t}\n${body.slice(0, 400)}`)) return true;
+  return false;
+}
+
+function challengeError(url) {
+  return Object.assign(new Error(
+    `anti-bot challenge page served for ${url} (the site demands human verification - no content to read or film). ` +
+    'If this site repeats it, remove/replace it in sources.md'), { challenge: true });
+}
+
 export function findObscura(explicit = null) {
   // Locate OS-appropriate obscura binary: .exe on Windows, 'obscura' on Linux/macOS.
   const isWin = os.platform() === 'win32';
@@ -112,14 +156,19 @@ function clean(d, limit = 12000) {
 }
 
 async function visit(page, cfg, url = null) {
-  await page.goto(url ?? cfg.url, { waitUntil: 'load', timeout: cfg.timeout * 1000 });
+  const target = url ?? cfg.url;
+  await page.goto(target, { waitUntil: 'load', timeout: cfg.timeout * 1000 });
   await page.waitForTimeout(Math.max(cfg.wait, 1.5) * 1000);
-  return clean(await ev(page, EXTRACT_JS));
+  const d = await ev(page, EXTRACT_JS);
+  if (looksLikeChallenge(d.title, d.text)) throw challengeError(target);
+  return clean(d);
 }
 
 async function visitLinks(page, cfg, url) {
   await page.goto(url, { waitUntil: 'load', timeout: cfg.timeout * 1000 });
   await page.waitForTimeout(Math.max(cfg.wait, 1.5) * 1000);
+  const d = await ev(page, EXTRACT_JS);
+  if (looksLikeChallenge(d.title, d.text)) throw challengeError(url);
   return ev(page, EXTRACT_LINKS_JS);
 }
 
@@ -197,6 +246,7 @@ export async function pageText(cfg, url = null) {
         }
         console.log(`[scrape] Obscura returned only ${text.length} chars; retrying with Chromium`);
       } catch (e) {
+        if (e?.challenge) throw e; // challenged: no point retrying with an even stealthier target's fallback
         console.log(`[scrape] Obscura failed (${firstLine(e)}); retrying with Chromium`);
       }
     }
@@ -219,13 +269,17 @@ export async function pageLinks(cfg, hubUrl) {
     if (exe) {
       try {
         links = await withObscura(cfg, exe, (pg) => visitLinks(pg, cfg, hubUrl));
-      } catch { links = []; }
+      } catch (e) {
+        if (e?.challenge) throw e; // protected hub: let the agent skip it entirely (no "hub itself" candidate)
+        links = [];
+      }
     }
   }
   if (links.length < 3) {
     try {
       links = await withChromium(cfg, (pg) => visitLinks(pg, cfg, hubUrl));
     } catch (e) {
+      if (e?.challenge) throw e; // protected hub: skip it in the agent instead of filming the challenge page
       console.log(`[scrape] could not extract links from ${hubUrl}: ${firstLine(e)}`);
       return [];
     }
