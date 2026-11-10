@@ -509,6 +509,18 @@ async function run(cfg, work) {
     if (aw !== vw || ah !== vh) {
       console.log(`warning: viewport is ${aw}x${ah}, requested ${vw}x${vh}; the encoder will fit it without stretching`);
     }
+    // Refuse to film an anti-bot challenge page (Imperva/Cloudflare/DataDome "verify you
+    // are human" interstitials): a fast, clear failure beats a 40-minute render of a
+    // security screen that would then get published.
+    {
+      const { looksLikeChallenge } = await import('./src/scrape.js');
+      const probePage = await ev(page,
+        '() => ({ t: document.title || "", b: document.body ? String(document.body.innerText).slice(0, 400) : "" })').catch(() => null);
+      if (probePage && looksLikeChallenge(probePage.t, probePage.b)) {
+        die('this site serves an anti-bot verification page instead of content - the video would just film it. ' +
+          'Try another URL, or use --browser obscura (some sites only block stock headless Chrome).');
+      }
+    }
     if (cfg.warmup) await warmUp(page, Math.max(ah - 100, 100));
     const maxY = await maxScroll(page);
     const nOut = wav ? Math.ceil((cfg.start_delay + secs + cfg.pause) * cfg.fps) : null;
