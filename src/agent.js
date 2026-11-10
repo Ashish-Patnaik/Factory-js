@@ -144,10 +144,20 @@ Return ONLY valid JSON in this exact format:
     }
   }
 
-  // Fallback to first readable candidate
-  const chosen = candidates[picks[0]];
-  const content = await pageText(cfg, chosen.url);
-  return { url: chosen.url, title: chosen.title, content };
+  // All AI picks were unreadable (empty pages or anti-bot challenges): walk a few more
+  // candidates linearly instead of dying on the first pick.
+  const tried = new Set(picks.map((p) => candidates[p]));
+  for (const c of candidates.filter((x) => !tried.has(x)).slice(0, 12)) {
+    try {
+      const content = await pageText(cfg, c.url);
+      if (content.length >= 250) {
+        console.log(`[agent] AI picks unreadable; fell back to ${c.url} (${c.title})`);
+        return { url: c.url, title: c.title, content };
+      }
+    } catch { /* challenged or empty - try the next candidate */ }
+  }
+  throw new Error('no readable candidate found (anti-bot challenges or empty pages everywhere) - ' +
+    'add more sources to sources.md or drop the protected ones');
 }
 
 export async function generateContentPackage(cfg, url, pageContent) {
