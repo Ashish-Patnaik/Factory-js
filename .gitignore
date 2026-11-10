@@ -1,0 +1,24 @@
+# dependencies / run artifacts
+node_modules/
+.cache/
+output/*.mp4
+output/*.meta.json
+output/*.txt
+output/*.wav
+output/*.mp3
+
+# secrets - NEVER commit these (they live in GitHub repo Secrets instead)
+token.json
+client_secrets.json
+.env
+env.txt
+insta env.txt
+*.b64
+
+# local browser binaries (not used on GitHub Actions; scraping falls back to Chromium)
+obscura/
+
+# OS junk
+.DS_Store
+Thumbs.db
+__pycache__/

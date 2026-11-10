@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phonon-2 Backend Check</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  table { width: 100%; border-collapse: collapse; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+  td, th { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  .pass { color: var(--ok); font-weight: 600; } .fail { color: var(--live); font-weight: 600; }
+  pre { white-space: pre-wrap; font-size: 12.5px; color: var(--muted); }
+</style>
+<script type="module" src="test.js"></script>
+</head>
+<body>
+<main style="display:block">
+  <section class="panel">
+    <div class="panel-head"><h2>Backend check against the fp32 reference</h2><span class="pill" id="status">starting</span></div>
+    <table id="tbl"><thead><tr><th>backend</th><th>clip</th><th>audio</th><th>time</th><th>speed</th><th>vs reference</th></tr></thead><tbody></tbody></table>
+    <pre id="log"></pre>
+  </section>
+</main>
+</body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "phonon-cli"
+description = "Native test bench for the Phonon-2 Rust port: golden checks against the reference, transcription, benchmarks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "phonon-rs"
+path = "src/main.rs"
+
+[features]
+default = []
+gpu = ["dep:phonon-gpu", "dep:pollster"]
+
+[dependencies]
+phonon-core = { path = "../phonon-core" }
+phonon-gpu = { path = "../phonon-gpu", optional = true }
+pollster = { version = "0.4", optional = true }
+serde_json = "1"
+hound = "3.5"
+rayon = "1.10"

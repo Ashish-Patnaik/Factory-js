@@ -1,0 +1,105 @@
+name: AI Content Factory
+
+# 4 runs a day. Cron is ALWAYS UTC; IST = UTC+5:30, so:
+#   03:37 UTC = 09:07 IST   07:37 UTC = 13:07 IST
+#   11:37 UTC = 17:07 IST   17:37 UTC = 23:07 IST
+# GitHub schedules are routinely delayed a few minutes (more near the top of the
+# hour), which is why the minutes are offset to :37. This is normal and expected.
+on:
+  schedule:
+    - cron: '37 3,7,11,17 * * *'
+  workflow_dispatch: # 1-click manual trigger from the Actions tab
+
+permissions:
+  contents: write # the history.json commit at the end needs this
+
+concurrency:
+  group: ai-video-factory
+  cancel-in-progress: false # never kill a run mid-upload; the next one queues
+
+jobs:
+  produce-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      # Models (phonon-31m TTS ~65 MB, phonon-2 ASR ~164 MB) live in .cache/;
+      # Playwright's Chromium lives in ~/.cache/ms-playwright. Both survive
+      # between runs, so only the very first run pays the download cost.
+      - name: Cache TTS/ASR models and Playwright browser
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache
+            ~/.cache/ms-playwright
+          key: factory-${{ runner.os }}-models-v1
+          restore-keys: |
+            factory-${{ runner.os }}-models-
+
+      - name: Install npm dependencies
+        run: |
+          npm ci
+          # Verifies the bundled ASR wasm engine (vendor/phonon-2-web/web/pkg-st).
+          # Instant when the prebuilt engine is committed; needs Rust only if missing.
+          node scripts/setup-asr.mjs
+
+      - name: Install Playwright Chromium + system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends fonts-noto-color-emoji fonts-noto-core
+          npx playwright install --with-deps chromium
+
+      - name: Restore YouTube OAuth files from Secrets
+        env:
+          YT_CLIENT_SECRETS_B64: ${{ secrets.YT_CLIENT_SECRETS_B64 }}
+          YT_TOKEN_JSON_B64: ${{ secrets.YT_TOKEN_JSON_B64 }}
+        run: |
+          echo "$YT_CLIENT_SECRETS_B64" | base64 --decode > client_secrets.json
+          echo "$YT_TOKEN_JSON_B64" | base64 --decode > token.json
+
+      - name: Preflight environment check (diagnostics, never fails the job)
+        run: node scripts/doctor.mjs
+
+      - name: Run the factory (scout -> script -> render -> publish YT + IG -> cleanup)
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          # Instagram's API rejects reels longer than 90 s (in-app 3-min limit does not
+          # apply to the API). The factory caps every video at render time so a long AI
+          # script can never produce an upload that dies in Meta's transcoder.
+          REEL_MAX_SECONDS: '89'
+          TZ: Asia/Kolkata # keep "today" and content dates on IST
+        run: node main.js --auto --random --publish all
+
+      - name: Shred temporary OAuth files from runner disk
+        if: always()
+        run: rm -f client_secrets.json token.json
+
+      - name: Commit updated output/history.json
+        if: always() # record published topics even when one platform fails, so they are never re-picked
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p output
+          if [ -f output/history.json ]; then
+            git add -f output/history.json
+            if git diff --cached --quiet; then
+              echo "history.json unchanged"
+            else
+              git commit -m "chore: update history.json after published short/reel [skip ci]"
+              git pull --rebase origin "${{ github.ref_name }}"
+              git push
+            fi
+          else
+            echo "no output/history.json produced this run (pipeline failed before publish)"
+          fi

@@ -1,0 +1,39 @@
+{
+  "name": "ai-content-factory",
+  "version": "2.0.0",
+  "description": "Scrolling website video & autonomous AI content factory - Node.js edition (no ffmpeg: mediabunny + WebCodecs, phonon TTS/ASR on-device)",
+  "type": "module",
+  "main": "main.js",
+  "bin": {
+    "factory": "main.js"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "scripts": {
+    "setup:asr": "node scripts/setup-asr.mjs",
+    "doctor": "node scripts/doctor.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "^1.30.0",
+    "@mediabunny/aac-encoder": "^1.65.2",
+    "duck-duck-scrape": "^2.2.7",
+    "mediabunny": "^1.65.2",
+    "phonon-tts": "^0.6.0",
+    "playwright": "^1.57.0",
+    "sharp": "^0.34.5"
+  },
+  "keywords": [
+    "video",
+    "shorts",
+    "reels",
+    "youtube",
+    "instagram",
+    "tts",
+    "asr",
+    "gemini",
+    "mediabunny",
+    "obscura"
+  ],
+  "license": "MIT"
+}

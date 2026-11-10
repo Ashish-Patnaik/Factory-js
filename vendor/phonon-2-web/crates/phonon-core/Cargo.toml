@@ -1,0 +1,16 @@
+[package]
+name = "phonon-core"
+description = "Phonon-2 speech recognition in pure Rust: container reader, log-mel front end, FastConformer encoder, TDT decoder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+default = ["parallel"]
+parallel = ["dep:rayon"]
+
+[dependencies]
+serde_json = "1"
+ruzstd = "0.8"
+rayon = { version = "1.10", optional = true }

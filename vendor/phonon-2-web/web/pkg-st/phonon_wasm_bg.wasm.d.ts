@@ -1,0 +1,25 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const __wbg_phonon_free: (a: number, b: number) => void;
+export const phonon_enableGl: (a: number) => [number, number, number, number];
+export const phonon_enableGpu: (a: number) => any;
+export const phonon_info: (a: number) => [number, number];
+export const phonon_liveFeed: (a: number, b: number, c: number) => any;
+export const phonon_liveFinish: (a: number) => any;
+export const phonon_liveReset: (a: number) => void;
+export const phonon_load: (a: number, b: number, c: number, d: number, e: number) => [number, number, number];
+export const phonon_release: (a: number, b: number, c: number) => void;
+export const phonon_transcribe: (a: number, b: number, c: number) => any;
+export const phonon_useBackend: (a: number, b: number, c: number) => [number, number];
+export const wasm_bindgen_1dae03bd03433b25___convert__closures_____invoke___js_sys_509fdf4112609f85___Function_fn_wasm_bindgen_1dae03bd03433b25___JsValue_____wasm_bindgen_1dae03bd03433b25___sys__Undefined___js_sys_509fdf4112609f85___Function_fn_wasm_bindgen_1dae03bd03433b25___JsValue_____wasm_bindgen_1dae03bd03433b25___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+export const wasm_bindgen_1dae03bd03433b25___convert__closures_____invoke___wasm_bindgen_1dae03bd03433b25___JsValue__core_98e5b52de1ee3cd3___result__Result_____wasm_bindgen_1dae03bd03433b25___JsError___true_: (a: number, b: number, c: any) => [number, number];
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_destroy_closure: (a: number, b: number) => void;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_start: () => void;

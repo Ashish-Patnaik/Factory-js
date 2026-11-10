@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = ["crates/phonon-core", "crates/phonon-gpu", "crates/phonon-gl", "crates/phonon-cli", "crates/phonon-wasm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/unvop/phonon-2-web"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false
+
+# Tests and the CLI are run against real 30 s clips: keep them optimised.
+[profile.dev]
+opt-level = 2
+
+[profile.dev.package."*"]
+opt-level = 3

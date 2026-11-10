@@ -1,0 +1,13 @@
+[package]
+name = "phonon-gpu"
+description = "Phonon-2 FastConformer encoder on WebGPU (wgpu): browser WebGPU, Metal, Vulkan, D3D12"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+phonon-core = { path = "../phonon-core", default-features = false }
+wgpu = "30"
+bytemuck = { version = "1", features = ["derive"] }
+futures-channel = "0.3"

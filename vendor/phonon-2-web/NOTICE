@@ -1,0 +1,20 @@
+Phonon-2 Web
+Copyright 2026 the Phonon-2 Web authors
+https://github.com/unvop/phonon-2-web
+
+This product is an independent Rust, WebAssembly, WebGPU and WebGL implementation of the Phonon-2 speech
+recognition runtime. It is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+MODEL WEIGHTS (not included)
+The app downloads the Phonon-2 weights at run time from https://huggingface.co/FermionResearch/Phonon-2.
+Phonon-2 is (c) 2026 Fermion Research and licensed under CC BY 4.0. It is derived from NVIDIA Parakeet-TDT 0.6B v3
+(https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3), also licensed under CC BY 4.0.
+
+REFERENCE IMPLEMENTATIONS
+The container format and network architecture were implemented from the Apache-2.0 `fermion-research` package
+(https://pypi.org/project/fermion-research/) and the Apache-2.0 Hugging Face Transformers Parakeet implementation
+(https://github.com/huggingface/transformers).
+
+SAMPLE AUDIO
+web/samples/ and testdata/libri*.wav are utterances from LibriSpeech (Panayotov et al., 2015; CC BY 4.0,
+https://www.openslr.org/12), as redistributed in hf-internal-testing/librispeech_asr_dummy.

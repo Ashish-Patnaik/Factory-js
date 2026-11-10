@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Phonon-2 Web</title>
+<meta name="description" content="Phonon-2 speech recognition running entirely in your browser: WebAssembly on the CPU, WebGPU or WebGL on the GPU.">
+<link rel="stylesheet" href="style.css">
+<script type="module" src="coi.js"></script>
+<script type="module" src="app.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+    <h1>Phonon-2 <span>in your browser</span></h1>
+  </div>
+  <p class="lede">Speech recognition with the 164&nbsp;MB Phonon-2 model, running on this device: WebAssembly on the CPU, or WebGPU / WebGL on the GPU. Audio never leaves the page.</p>
+</header>
+
+<main>
+  <section class="panel" id="model-panel" aria-labelledby="model-h">
+    <div class="panel-head">
+      <h2 id="model-h">Model</h2>
+      <span class="pill" id="model-state">not loaded</span>
+    </div>
+    <div class="progress" id="progress" hidden>
+      <div class="bar"><div class="fill" id="progress-fill"></div></div>
+      <div class="progress-text" id="progress-text"></div>
+    </div>
+    <div class="row">
+      <button id="load-btn" class="primary">Load Phonon-2</button>
+      <label class="ghost file-btn">Use local files…
+        <input type="file" id="model-file" multiple accept=".zst,.fermion,.json">
+      </label>
+      <span class="hint" id="model-hint">Downloads once from Hugging Face (163&nbsp;MB), then loads from the browser cache.</span>
+    </div>
+    <div class="facts" id="facts" hidden></div>
+  </section>
+
+  <section class="panel" id="backend-panel" aria-labelledby="backend-h">
+    <div class="panel-head">
+      <h2 id="backend-h">Compute</h2>
+    </div>
+    <div class="segmented" role="radiogroup" aria-label="Backend">
+      <button role="radio" aria-checked="true" data-backend="auto" id="be-auto">
+        <strong>Auto</strong><small id="auto-sub">fastest on this device</small>
+      </button>
+      <button role="radio" aria-checked="false" data-backend="cpu" id="be-cpu">
+        <strong>CPU</strong><small id="cpu-sub">WebAssembly SIMD</small>
+      </button>
+      <button role="radio" aria-checked="false" data-backend="webgpu" id="be-webgpu">
+        <strong>WebGPU</strong><small id="webgpu-sub">GPU compute</small>
+      </button>
+      <button role="radio" aria-checked="false" data-backend="webgl" id="be-webgl">
+        <strong>WebGL</strong><small id="webgl-sub">GPU, older browsers</small>
+      </button>
+    </div>
+    <p class="hint" id="backend-note"></p>
+    <p class="hint device" id="device"></p>
+  </section>
+
+  <section class="panel wide" id="live-panel" aria-labelledby="live-h">
+    <div class="panel-head">
+      <h2 id="live-h">Live dictation</h2>
+      <div class="meter" aria-hidden="true"><div id="meter-fill"></div></div>
+    </div>
+    <div class="row">
+      <button id="mic-btn" class="mic" disabled aria-pressed="false">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v6a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-2.08A7 7 0 0 0 19 12h-2Z"/></svg>
+        <span id="mic-label">Start listening</span>
+      </button>
+      <span class="hint" id="live-stat">A pause ends each sentence.</span>
+    </div>
+    <div class="transcript" id="live-out" aria-live="polite"><span class="placeholder">Your words appear here.</span></div>
+    <div class="row end">
+      <button class="ghost small" id="live-copy" disabled>Copy</button>
+      <button class="ghost small" id="live-clear" disabled>Clear</button>
+    </div>
+  </section>
+
+  <section class="panel wide" id="file-panel" aria-labelledby="file-h">
+    <div class="panel-head">
+      <h2 id="file-h">Transcribe a file</h2>
+    </div>
+    <div class="row" style="margin-bottom:12px">
+      <button class="ghost" id="sample-btn" disabled>Try a sample clip</button>
+      <span class="hint">LibriSpeech, 29 s</span>
+    </div>
+    <label class="drop" id="drop">
+      <input type="file" id="audio-file" accept="audio/*,video/*">
+      <span><strong>Choose an audio or video file</strong> or drop it here. Any length; long audio is cut at pauses into 25–35&nbsp;s windows.</span>
+    </label>
+    <div class="result" id="file-result" hidden>
+      <div class="stat" id="file-stat"></div>
+      <audio id="player" controls></audio>
+      <div class="transcript words" id="file-out"></div>
+      <div class="row end">
+        <button class="ghost small" id="file-copy">Copy text</button>
+        <button class="ghost small" id="file-srt">Download .srt</button>
+        <button class="ghost small" id="file-json">Download .json</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>
+  <a href="https://github.com/unvop/phonon-2-web">Source on GitHub</a> (Apache-2.0).
+  Model: <a href="https://huggingface.co/FermionResearch/Phonon-2">Phonon-2</a> by Fermion Research (CC-BY-4.0), derived from
+  <a href="https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3">NVIDIA Parakeet-TDT 0.6B v3</a> (CC-BY-4.0).
+  This page runs an independent Rust/WebAssembly port of its runtime.
+</footer>
+</body>
+</html>
