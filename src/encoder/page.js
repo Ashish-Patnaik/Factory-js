@@ -301,19 +301,26 @@ class Session {
 // ---------------------------------------------------------------------------
 // Slideshow (--image): Ken Burns + crossfades, composed here with no host round-trips
 // ---------------------------------------------------------------------------
-const SS_W = 2880, SS_H = 1620;   // supersampled slide canvas (16:9), like slides.py
+let SS_W = 2880, SS_H = 1620;   // supersampled slide canvas (16:9 default; prepareSlides re-fits it to the output aspect so 9:16 / 1:1 slideshows never distort)
 const COVER_KEEP = 0.60;
 const MOTIONS = ['in', 'out', 'panright', 'panleft', 'in', 'out', 'panright', 'out'];
 
-function fitSlideCanvas(bmp) {
+function fitSlideCanvas(bmp, fitMode = null) {
   // Port of slides.py fit_slide: cover-crop when safe, cinematic blur-fill for extremes.
+  // fitMode 'exact' (reddit --video-style card): the image was pre-composed at the exact
+  // output aspect - draw it full-bleed, no crop, no shrink.
   const c = new OffscreenCanvas(SS_W, SS_H);
   const ctx = c.getContext('2d');
+  ctx.imageSmoothingQuality = 'high';
+  if (fitMode === 'exact') {
+    const s = Math.max(SS_W / bmp.width, SS_H / bmp.height);
+    ctx.drawImage(bmp, (SS_W - bmp.width * s) / 2, (SS_H - bmp.height * s) / 2, bmp.width * s, bmp.height * s);
+    return c;
+  }
   const ar = bmp.width / bmp.height;
   const target = SS_W / SS_H;
   const okAr = ar >= 1 / 8 && ar <= 8;
   const coverOk = okAr && ((ar >= target && target / ar >= COVER_KEEP) || (ar < target && ar / target >= COVER_KEEP));
-  ctx.imageSmoothingQuality = 'high';
   if (coverOk) {
     // ImageOps.fit equivalent, centre-weighted slightly up (centering=(0.5, 0.42))
     const s = Math.max(SS_W / bmp.width, SS_H / bmp.height);
@@ -504,13 +511,24 @@ export const api = {
   },
 
   // --- slideshow ----------------------------------------------------------
-  async prepareSlides(jpegs) {
+  async prepareSlides(jpegs, fitMode = null) {
+    // Re-fit the supersampled slide canvas to the session's output aspect: 16:9 keeps the
+    // classic 2880x1620 canvas, 9:16 gets 1620x2880 (and 1:1 square) so vertical slides are
+    // never squashed by renderSlides' full-canvas drawImage.
+    const outW = session.width, outH = session.height;
+    if (outW > outH) {
+      SS_W = 2880;
+      SS_H = Math.max(2, Math.round(2880 * outH / outW));
+    } else {
+      SS_H = 2880;
+      SS_W = Math.max(2, Math.round(2880 * outW / outH));
+    }
     const slides = [];
     for (const b64 of jpegs) {
       try {
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
         const bmp = await decodeImage(bytes);
-        slides.push(fitSlideCanvas(bmp));
+        slides.push(fitSlideCanvas(bmp, fitMode));
         bmp.close();
       } catch (e) {
         log('skipping unreadable slide:', e?.message ?? e);

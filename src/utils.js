@@ -131,6 +131,24 @@ export async function duration(p) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Reddit session cookie string -> Playwright cookie descriptors ("token2=abc; loid=xyz").
+// A logged-in session cookie bypasses Reddit's 2026 anti-bot wall (js_challenge interstitials
+// and the old.reddit login requirement). Shared by reddit mode and the video browser.
+export function parseRedditCookies(raw) {
+  const s = String(raw ?? '').trim();
+  if (!s) return [];
+  const out = [];
+  for (const pair of s.split(';')) {
+    const idx = pair.indexOf('=');
+    if (idx < 1) continue;
+    const name = pair.slice(0, idx).trim();
+    const value = pair.slice(idx + 1).trim();
+    if (!name || !value) continue;
+    out.push({ name, value, domain: '.reddit.com', path: '/', secure: true });
+  }
+  return out;
+}
+
 // Python-style page.evaluate: the snippet string is an arrow-function expression that must be
 // auto-invoked (Python Playwright does this; Node Playwright needs the explicit wrap).
 export function evFn(src) {

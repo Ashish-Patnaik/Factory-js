@@ -2,7 +2,7 @@
 // popup killer, dismiss sweep and the deterministic virtual-time shim used by frame capture.
 import { chromium } from 'playwright';
 import { findObscura, startObscura, stopProcess } from './scrape.js';
-import { ev } from './utils.js';
+import { ev, parseRedditCookies } from './utils.js';
 
 export const MOBILE_UA =
   'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 ' +
@@ -120,6 +120,15 @@ function contextOpts(cfg, vw, vh) {
   };
 }
 
+// Reddit session cookies (--reddit-cookie / REDDIT_SESSION_COOKIE): a logged-in
+// session skips Reddit's 2026 anti-bot wall, which would otherwise be filmed into
+// the scroll video. Best-effort - a bad cookie string never breaks a render.
+async function applyRedditCookies(ctx, cfg) {
+  const cookies = parseRedditCookies(cfg?.reddit_cookie);
+  if (!cookies.length) return;
+  try { await ctx.addCookies(cookies); } catch { /* best effort */ }
+}
+
 export class Browser {
   /** Playwright Chromium (or installed Chrome/Edge via --channel). Always cleaned up. */
   constructor(cfg) {
@@ -153,6 +162,7 @@ export class Browser {
 
   async newPage(vw, vh) {
     const ctx = await this.browser.newContext(contextOpts(this.cfg, vw, vh));
+    await applyRedditCookies(ctx, this.cfg);
     try { await ctx.addInitScript(POPUP_KILLER_JS); } catch { /* ignore */ }
     if (this.cfg.mode === 'virtual') {
       try { await ctx.addInitScript(SHIM_JS); } catch { /* ignore */ }
@@ -238,10 +248,12 @@ export class ObscuraBrowser extends Browser {
     let page;
     try {
       const ctx = await this.browser.newContext(opts);
+      await applyRedditCookies(ctx, this.cfg);
       try { await ctx.addInitScript(POPUP_KILLER_JS); } catch { /* ignore */ }
       page = await ctx.newPage();
     } catch {
       const ctx = this.browser.contexts[0] ?? await this.browser.newContext();
+      await applyRedditCookies(ctx, this.cfg);
       try { await ctx.addInitScript(POPUP_KILLER_JS); } catch { /* ignore */ }
       page = await ctx.newPage();
       try { await page.setViewportSize({ width: vw, height: vh }); } catch { /* ignore */ }

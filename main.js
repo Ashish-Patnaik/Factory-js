@@ -33,6 +33,10 @@ const EXAMPLES = `Examples:
   node main.js --auto --long --avatar                        same, with a looping talking-character gif in the corner
   node main.js --entertainment                             entertainment story (films/anime/TV/comics) -> Shorts & Reels
   node main.js --entertainment --long                      entertainment video essay -> 5-7 min YouTube long-form
+  node main.js --reddit --publish instagram                 reddit screenshot post: random subreddit -> AI-picked hot post -> caption -> IG feed
+  node main.js --reddit --full --publish instagram          same with the full-post screenshot (--short/--snippet = truncated card)
+  node main.js --reddit --video --publish all               reddit story video: screenshot + TTS voice-over -> YT Shorts + IG Reels
+  node main.js --reddit --video --video-style card          same video, but as a static screenshot card on a blurred background
   node main.js --auto --publish all                          autonomous end-to-end: scout -> render -> post YT & IG
   node main.js https://example.com demo --mobile --narrate   single URL in mobile view with AI voice-over
   node main.js https://example.com demo --long               long-form: 5-7 min script, 16:9 slow-scroll video
@@ -52,6 +56,18 @@ autonomous AI agent:
   --persona <file>          creator persona & style file (default: persona.md)
   --publish <choice>        automatically publish finished video to YouTube Shorts, Instagram Reels, or both (all) [none|youtube|instagram|all]
   --yt-privacy <choice>     YouTube Short privacy status when publishing (default: public) [public|unlisted|private]
+
+reddit (the b.mjs integration):
+  --reddit                  reddit mode: pick a random subreddit from sources_reddit.md, read its hot section, let the AI pick the post it likes, capture a clean b.mjs-style screenshot and write a persona caption (with --publish instagram it goes out as an Instagram FEED image post, not a reel)
+  --video                   with --reddit: also build a 9:16 TTS voice-over video (summary + hot-take script, TikTok captions) ready for YouTube Shorts & Instagram Reels
+  --video-style <choice>    --video look [scroll|card]: scroll = slow pan down the restyled post page (default); card = the screenshot composed on a blurred background, static
+  --full                    screenshot style: capture the whole post with read-more expanded (b.mjs --long)
+  --snippet                 screenshot style: truncate long text with a fade (b.mjs --short) - default
+                            (--long / --short still work as aliases of --full / --snippet inside --reddit mode)
+  --subreddits <file>       subreddit list to pick from (default: sources_reddit.md)
+  --subreddit <name>        pin one subreddit instead of picking randomly (name, r/name or full URL)
+  --post-url <url>          skip discovery: use this exact reddit post URL
+  --image-url <url>         public URL of the screenshot for the IG image post (skips the automatic catbox.moe upload)
 
 scroller video:
   --mobile                  load and scroll the site in mobile view (phone viewport, touch, mobile UA, 9:16 default)
@@ -202,8 +218,8 @@ function parse() {
             case '--image-limit': g.image_limit = parseInt(next(), 10); break;
             case '--slide-seconds': g.slide_seconds = parseFloat(next()); break;
             case '--image-sources': g.image_sources = next(); break;
-            case '--kenburns': g.kenburns = true; break;
-            case '--no-kenburns': g.kenburns = false; break;
+            case '--kenburns': g.kenburns = true; g.kenburns_given = true; break;
+            case '--no-kenburns': g.kenburns = false; g.kenburns_given = true; break;
             case '--narrate': g.narrate = true; break;
             case '--text': g.text = next(); break;
             case '--text-file': g.text_file = next(); break;
@@ -233,6 +249,17 @@ function parse() {
             case '--separate': g.separate = true; break;
             case '--keep-files': g.keep_files = true; break;
             case '--encoder-channel': g.encoder_channel = next(); break;
+            case '--reddit': g.reddit = true; break;
+            case '--video': g.reddit_video = true; break;
+            case '--full': g.reddit_full = true; g.reddit_style_given = (g.reddit_style_given ?? 0) + 1; break;
+            case '--snippet': g.reddit_full = false; g.reddit_style_given = (g.reddit_style_given ?? 0) + 1; break;
+            case '--short': g.short = true; break;
+            case '--video-style': g.video_style = next(); break;
+            case '--subreddits': g.subreddits = next(); break;
+            case '--subreddit': g.subreddit = next(); break;
+            case '--post-url': g.post_url = next(); break;
+            case '--reddit-cookie': g.reddit_cookie = next(); break;
+            case '--image-url': g.image_url = next(); break;
             default: die(`unknown argument: ${a}\n${EXAMPLES}`);
           }
         } else if (url === null) url = a;
@@ -246,6 +273,35 @@ function parse() {
     if (g.sources === 'sources.md') g.sources = 'sources_entertainment.md'; // --sources not given
     if (url) g.narrate = !(g.text || g.text_file); // entertainment-style story for a direct URL too
     else g.auto = true; // no URL: crawl the entertainment hubs and pick the story like --auto
+  }
+  if (g.reddit) {
+    if (g.auto) die('--reddit cannot be combined with --auto (reddit mode has its own agent)');
+    if (g.entertainment) die('--reddit cannot be combined with --entertainment');
+    // b.mjs compatibility: inside --reddit, --long/--short mean the screenshot style, NOT long-form video
+    const aliasCount = (g.long ? 1 : 0) + (g.short ? 1 : 0);
+    if ((g.reddit_style_given ?? 0) + aliasCount > 1) {
+      die('please pass ONE screenshot style (--full or --snippet; --long/--short work as aliases), not several');
+    }
+    if (g.short) g.reddit_full = false;
+    else if (g.long) g.reddit_full = true;
+    if (g.reddit_full === undefined) g.reddit_full = false; // default: snippet (truncated card with fade)
+    if (aliasCount) {
+      console.log(`[reddit] --long/--short are aliases here: screenshot style = ${g.reddit_full ? 'full' : 'snippet'} ` +
+        '(they do NOT switch on long-form video inside --reddit)');
+    }
+    g.long = false; g.mobile = false; // the reddit flow manages its own render configs
+  } else {
+    if (g.reddit_video) die('--video works with --reddit only: node main.js --reddit --video');
+    for (const [flag, val] of [
+      ['--short', g.short], ['--full', g.reddit_full === true], ['--snippet', g.reddit_full === false],
+      ['--video-style', g.video_style], ['--subreddits', g.subreddits], ['--subreddit', g.subreddit],
+      ['--post-url', g.post_url], ['--reddit-cookie', g.reddit_cookie], ['--image-url', g.image_url],
+    ]) {
+      if (val) die(`${flag} works with --reddit only`);
+    }
+  }
+  if (g.reddit_video && g.video_style && !['scroll', 'card'].includes(g.video_style)) {
+    die('--video-style must be scroll or card');
   }
   if (g.auto) {
     g.mobile = !g.long;
@@ -339,6 +395,7 @@ function parse() {
     persona_file: g.persona, entertainment: g.entertainment,
     script_seconds: g.script_seconds, script_only: g.script_only, scraper: g.scraper,
     obscura_path: g.obscura_path ?? null, private_net: g.allow_private_network,
+    reddit_cookie: g.reddit_cookie ?? process.env.REDDIT_SESSION_COOKIE ?? null,
     llm_model: g.llm_model, voice: g.voice, tts_model: g.tts_model,
     tts_quant: g.tts_quant, tts_lang: g.tts_lang, whisper_model: g.whisper_model,
     captions: g.captions, cap_style: g.cap_style,
@@ -521,6 +578,11 @@ async function run(cfg, work) {
           'Try another URL, or use --browser obscura (some sites only block stock headless Chrome).');
       }
     }
+    if (cfg.reddit_style) {
+      // --reddit --video (scroll style): turn the live post page into the clean b.mjs card first
+      const { styleRedditPage } = await import('./src/reddit.js');
+      await styleRedditPage(page, cfg);
+    }
     if (cfg.warmup) await warmUp(page, Math.max(ah - 100, 100));
     const maxY = await maxScroll(page);
     const nOut = wav ? Math.ceil((cfg.start_delay + secs + cfg.pause) * cfg.fps) : null;
@@ -600,6 +662,12 @@ async function main() {
   let pkg = null;
   let metaPath = null;
   try {
+    if (g.reddit) {
+      // The reddit pipeline is self-contained: discovery -> screenshot -> caption/video -> publish.
+      const reddit = await import('./src/reddit.js');
+      await reddit.runRedditFlow(cfg, g, work, { renderVideo: (vcfg) => run(vcfg, work) });
+      return;
+    }
     if (g.auto || g.publish !== 'none') {
       const agent = await import('./src/agent.js');
       const { pageText } = await import('./src/scrape.js');

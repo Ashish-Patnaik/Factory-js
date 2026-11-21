@@ -47,9 +47,11 @@ export async function renderSlideshow(host, cfg, slidePaths, { assData = null, t
     `(audio ${totalS.toFixed(1)}s) at ${width}x${height}`);
 
   if (assData) await host.setCaptions(assData);
-  // slide images -> the encoder page pre-fits them to the 2880x1620 slide canvas (cover or blur-fill)
+  // slide images -> the encoder page pre-fits them to the supersampled slide canvas (cover,
+  // blur-fill, or 'exact' when cfg.slide_fit is set - the reddit card video pre-composes its
+  // frames at the exact output aspect)
   const jpegs = await readSlideJpegsB64(slides);
-  const fitted = await host.rpc('prepareSlides', jpegs);
+  const fitted = await host.rpc('prepareSlides', jpegs, cfg.slide_fit ?? null);
   if (fitted < 2) throw new Error('--image found fewer than 2 usable images');
   const order = slides.map((_, i) => i);
   const info = await host.rpc('renderSlides', {

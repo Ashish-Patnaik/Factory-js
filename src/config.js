@@ -41,6 +41,7 @@ export function defaultConfig(overrides = {}) {
     script_only: false,
     scraper: 'obscura',    // obscura (falls back to chromium) | chromium
     obscura_path: null,
+    reddit_cookie: null,   // --reddit-cookie / REDDIT_SESSION_COOKIE (logged-in session skips Reddit's anti-bot wall)
     private_net: false,
     llm_model: 'gemini-3.5-flash-lite',
     voice: 'Easton',
