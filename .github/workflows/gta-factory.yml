@@ -1,0 +1,132 @@
+
+name: GTA 6 AI Shorts Factory
+
+on:
+  schedule:
+    # 3:07 PM IST
+    - cron: '37 9 * * *'
+    # 9:07 PM IST
+    - cron: '37 15 * * *'
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ai-video-factory
+  cancel-in-progress: false
+
+jobs:
+  produce-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      # 1. Checkout repository
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      # 2. Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # 3. Setup Deno for YouTube extraction
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      # 4. Cache browser and application files
+      - name: Cache application files
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache
+            ~/.cache/ms-playwright
+          key: ${{ runner.os }}-gta-factory-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-gta-factory-
+
+      # 5. Install FFmpeg and system dependencies
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            ffmpeg \
+            fonts-liberation \
+            fonts-noto-color-emoji \
+            fonts-dejavu-core
+
+      # 6. Install yt-dlp
+      - name: Install yt-dlp
+        run: |
+          python3 -m pip install --user --break-system-packages --upgrade yt-dlp
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # 7. Verify dependencies
+      - name: Verify GTA dependencies
+        run: |
+          node --version
+          yt-dlp --version
+          ffmpeg -version
+          ffprobe -version
+          deno --version
+
+      # 8. Install Node dependencies
+      - name: Install Node dependencies
+        run: npm ci
+
+      # 9. Setup ASR
+      - name: Setup ASR
+        run: node scripts/setup-asr.mjs
+
+      # 10. Install Playwright Chromium
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      # 11. Restore YouTube OAuth credentials
+      - name: Restore YouTube credentials
+        env:
+          YT_CLIENT_SECRETS_B64: ${{ secrets.YT_CLIENT_SECRETS_B64 }}
+          YT_TOKEN_PICKLE_B64: ${{ secrets.YT_TOKEN_PICKLE_B64 }}
+        run: |
+          echo "$YT_CLIENT_SECRETS_B64" | base64 --decode > client_secrets.json
+          echo "$YT_TOKEN_PICKLE_B64" | base64 --decode > token.pickle
+
+      # 12. Generate and publish GTA Shorts
+      - name: Generate and publish GTA Shorts
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+        run: |
+          node main.js --gta --random --publish all
+
+      # 13. Cleanup credentials
+      - name: Cleanup OAuth credentials
+        if: always()
+        run: |
+          shred -u client_secrets.json token.pickle 2>/dev/null || true
+
+      # 14. Commit generation history
+      - name: Commit history
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add output/history.json
+
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update GTA content history"
+            git pull --rebase origin main
+            git push origin HEAD:main
+          else
+            echo "No history changes to commit."
+          fi
