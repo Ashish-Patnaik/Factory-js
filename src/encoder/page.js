@@ -2,11 +2,12 @@
 // "encoder page" launched by host.js. This is what replaces ffmpeg in the Node port:
 //
 //   * composes every video frame on an OffscreenCanvas (fit/pad on white, burned captions,
-//     avatar gif overlay, Ken Burns slideshow motion, crossfades) - the same visual pipeline
-//     the Python factory built with ffmpeg filters;
+//     avatar gif overlay, Ken Burns slideshow motion, crossfades, 9:16 video clips) - the
+//     same visual pipeline the Python factory built with ffmpeg filters;
 //   * encodes H.264 (yuv420p, limited range) via WebCodecs and muxes MP4 with mediabunny;
 //   * encodes AAC 44.1 kHz audio (native WebCodecs, with @mediabunny/aac-encoder's WASM
 //     encoder as the fallback when the browser build lacks AAC);
+//   * extracts 16 kHz mono PCM from source clips for on-device ASR fallback;
 //   * probes and auto-heals files for the Instagram Graph API (duration cap, silent audio).
 //
 // The host injects this file as a blob module with these two tokens rewritten:
@@ -16,7 +17,8 @@ import * as mb from '__MEDIABUNNY_URL__';
 import { registerAacEncoder } from '__AAC_ENCODER_URL__';
 
 const { Output, Mp4OutputFormat, BufferTarget, CanvasSource, VideoSampleSource, AudioBufferSource,
-  VideoSample, Input, ALL_FORMATS, BlobSource, Conversion, Quality } = mb;
+  VideoSample, Input, ALL_FORMATS, BlobSource, UrlSource, VideoSampleSink, AudioBufferSink,
+  Conversion, Quality } = mb;
 
 function log(...a) { console.log('[enc]', ...a); }
 
@@ -188,9 +190,11 @@ class Session {
     this.captions = null;   // { lines, style }
     this.avatar = null;     // { frames: [{image, timestamp, duration}], total, corner, sizePct }
     this.audio = { rate: 0, chunks: [] };
+    this.bgAudio = null;    // optional { left: Float32Array, right: Float32Array, gain } @ 44.1 kHz
     this.audioDelay = 0;
     this.t0 = 0;
     this.bytes = null;
+    this.pullPos = 0;
   }
 
   async init({ width, height, fps, quality, bitrate }) {
@@ -252,10 +256,25 @@ class Session {
     // matches the recommended profile. mediabunny derives the encoder channel count from
     // the buffer (verified in Chromium: 2ch in -> AAC decoderConfig numberOfChannels=2).
     const buf = new AudioBuffer({ numberOfChannels: 2, length: out.length, sampleRate: OUT });
-    // AudioBuffer is ZERO-FILLED on construction - without this copy the muxed AAC track
-    // is N seconds of perfect silence (video fine, audio "missing"). A/B-proven.
-    buf.getChannelData(0).set(out);
-    buf.getChannelData(1).set(out);
+    const bg = this.bgAudio;
+    if (bg && bg.gain > 0) {
+      const L = new Float32Array(need);
+      const R = new Float32Array(need);
+      const g = bg.gain;
+      for (let i = 0; i < need; i++) {
+        const gl = i < bg.left.length ? bg.left[i] * g : 0;
+        const gr = i < bg.right.length ? bg.right[i] * g : 0;
+        L[i] = Math.max(-0.98, Math.min(0.98, out[i] + gl));
+        R[i] = Math.max(-0.98, Math.min(0.98, out[i] + gr));
+      }
+      buf.getChannelData(0).set(L);
+      buf.getChannelData(1).set(R);
+    } else {
+      // AudioBuffer is ZERO-FILLED on construction - without this copy the muxed AAC track
+      // is N seconds of perfect silence (video fine, audio "missing"). A/B-proven.
+      buf.getChannelData(0).set(out);
+      buf.getChannelData(1).set(out);
+    }
     return buf;
   }
 
@@ -294,6 +313,7 @@ class Session {
     await this.vSrc.close();
     await this.output.finalize();
     this.bytes = new Uint8Array(this.output.target.buffer);
+    this.pullPos = 0;
     return { frames: this.frames, ms: performance.now() - this.t0, bytes: this.bytes.byteLength };
   }
 }
@@ -596,18 +616,219 @@ export const api = {
       if (f > 0 && f % 150 === 0) log(`slideshow frame ${f}/${totalFrames}`);
     }
     session.slidesFrames = totalFrames;
+    session.pullPos = 0;
     return { frames: totalFrames, ms: performance.now() - t0 };
+  },
+
+  // --- 16 kHz mono PCM extraction for on-device ASR fallback (--gta) -------
+  async extractAudio16k({ url, startSec, endSec }) {
+    const input = new Input({ formats: ALL_FORMATS, source: new UrlSource(url) });
+    try {
+      const aTrack = await input.getPrimaryAudioTrack();
+      if (!aTrack) return { samples: 0, sampleRate: 16000 };
+      const TARGET = 16000;
+      const dur = Math.max(0.5, endSec - startSec);
+      const totalOut = Math.ceil(dur * TARGET);
+      const pcm16 = new Int16Array(totalOut);
+      const sink = new AudioBufferSink(aTrack);
+      for await (const { buffer, timestamp } of sink.buffers(startSec, endSec)) {
+        const rate = buffer.sampleRate;
+        const ch0 = buffer.getChannelData(0);
+        const ch1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : null;
+        const outStart = Math.max(0, Math.floor((timestamp - startSec) * TARGET));
+        const outEnd = Math.min(totalOut, Math.floor((timestamp + buffer.duration - startSec) * TARGET));
+        for (let o = outStart; o < outEnd; o++) {
+          const tInBuf = (o / TARGET) - (timestamp - startSec);
+          const sIdx = Math.max(0, Math.min(ch0.length - 1, Math.floor(tInBuf * rate)));
+          const val = ch1 ? (ch0[sIdx] + ch1[sIdx]) * 0.5 : ch0[sIdx];
+          pcm16[o] = Math.max(-32768, Math.min(32767, Math.round(val * 32767)));
+        }
+      }
+      session ??= new Session();
+      session.extractedAudio = new Uint8Array(pcm16.buffer);
+      session.extractedPos = 0;
+      return { samples: totalOut, bytes: session.extractedAudio.byteLength, sampleRate: TARGET };
+    } finally {
+      try { await input.cancel?.(); } catch { /* ignore */ }
+    }
+  },
+
+  async pullExtractedAudio(chunkSize = 4 * 1024 * 1024) {
+    const b = session?.extractedAudio;
+    if (!b) return { b64: '', done: true };
+    const pos = session.extractedPos ?? 0;
+    const end = Math.min(pos + chunkSize, b.length);
+    let bin = '';
+    for (let i = pos; i < end; i += 0x8000) {
+      bin += String.fromCharCode.apply(null, b.subarray(i, Math.min(i + 0x8000, end)));
+    }
+    session.extractedPos = end;
+    if (end >= b.length) session.extractedAudio = null; // free memory immediately
+    return { b64: btoa(bin), done: end >= b.length };
+  },
+
+  // --- 9:16 video clip renderer (--gta, zero-ffmpeg via mediabunny) --------
+  async renderVideoClip({
+    videoUrl, audioUrl = null, startSec, endSec, fps, width, height,
+    quality, bitrate, fit = 'crop', gameAudioGain = 0.12,
+  }) {
+    const t0 = performance.now();
+    const videoInput = new Input({ formats: ALL_FORMATS, source: new UrlSource(videoUrl) });
+    let audioInput = null;
+    try {
+      const videoTrack = await videoInput.getPrimaryVideoTrack();
+      if (!videoTrack) throw new Error('source video has no decodable video track');
+      const srcDur = await videoInput.computeDuration();
+      const s0 = Math.max(0, Math.min(startSec, Math.max(0, srcDur - 1)));
+      const s1 = Math.max(s0 + 0.5, Math.min(endSec, srcDur));
+      const clipDur = s1 - s0;
+      const totalFrames = Math.max(1, Math.round(clipDur * fps));
+      const srcW = videoTrack.displayWidth ?? videoTrack.codedWidth;
+      const srcH = videoTrack.displayHeight ?? videoTrack.codedHeight;
+
+      // Best-effort subtle ambient game audio from [s0, s1]
+      session.bgAudio = null;
+      if (gameAudioGain > 0) {
+        try {
+          let aTrack = null;
+          if (audioUrl) {
+            audioInput = new Input({ formats: ALL_FORMATS, source: new UrlSource(audioUrl) });
+            aTrack = await audioInput.getPrimaryAudioTrack().catch(() => null);
+          } else {
+            aTrack = await videoInput.getPrimaryAudioTrack().catch(() => null);
+          }
+          if (aTrack) {
+            const OUT = 44100;
+            const need = Math.ceil(clipDur * OUT);
+            const left = new Float32Array(need);
+            const right = new Float32Array(need);
+            const aSink = new AudioBufferSink(aTrack);
+            for await (const { buffer, timestamp } of aSink.buffers(s0, s1)) {
+              const rate = buffer.sampleRate;
+              const ch0 = buffer.getChannelData(0);
+              const ch1 = buffer.numberOfChannels > 1 ? buffer.getChannelData(1) : ch0;
+              const baseOut = Math.round((timestamp - s0) * OUT);
+              for (let i = 0; i < ch0.length; i++) {
+                const pos = baseOut + Math.round((i / rate) * OUT);
+                if (pos >= 0 && pos < need) {
+                  left[pos] = ch0[i];
+                  right[pos] = ch1[i];
+                }
+              }
+            }
+            session.bgAudio = { left, right, gain: gameAudioGain };
+            log(`clip game audio extracted (${clipDur.toFixed(1)}s @ gain ${gameAudioGain})`);
+          }
+        } catch (e) {
+          log('game audio mix skipped:', e?.message ?? e);
+        }
+      }
+
+      const canvas = new OffscreenCanvas(width, height);
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.imageSmoothingQuality = 'high';
+      const rawCanvas = new OffscreenCanvas(width, height);
+      const rawCtx = rawCanvas.getContext('2d', { alpha: false });
+      rawCtx.imageSmoothingQuality = 'high';
+
+      const out = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
+      const rate = bitrate ?? crfToBitrate(quality, width, height, fps);
+      const vSrc = new VideoSampleSource({
+        codec: 'avc', keyFrameInterval: 2, quality: new Quality({ bitrate: rate }), latencyMode: 'quality',
+      });
+      out.addVideoTrack(vSrc, { frameRate: fps });
+      const aSrc = new AudioBufferSource({ codec: 'aac', bitrate: 128000 });
+      out.addAudioTrack(aSrc);
+      session.output2 = out;
+      session.vSrc2 = vSrc;
+      session.aSrc2 = aSrc;
+      await out.start();
+
+      // Vertical 9:16 framing geometry
+      const coverScale = Math.max(width / srcW, height / srcH);
+      const coverW = srcW * coverScale;
+      const coverH = srcH * coverScale;
+      const coverX = (width - coverW) / 2;
+      const coverY = (height - coverH) / 2;
+
+      const fgScale = Math.min(width / srcW, height / srcH) * (fit === 'zoom' ? 1.38 : 1.0);
+      const fgW = srcW * fgScale;
+      const fgH = srcH * fgScale;
+      const fgX = (width - fgW) / 2;
+      const fgY = Math.round((height - fgH) * 0.44);
+
+      const drawFramed = (sample) => {
+        if (fit === 'crop') {
+          rawCtx.fillStyle = '#000000';
+          rawCtx.fillRect(0, 0, width, height);
+          sample.draw(rawCtx, coverX, coverY, coverW, coverH);
+        } else {
+          // 'blur' or 'zoom': blurred darkened gameplay backdrop + crisp foreground
+          rawCtx.save();
+          rawCtx.filter = 'blur(28px) brightness(0.42)';
+          sample.draw(rawCtx, coverX, coverY, coverW, coverH);
+          rawCtx.restore();
+          rawCtx.save();
+          rawCtx.shadowColor = 'rgba(0,0,0,0.65)';
+          rawCtx.shadowBlur = 28;
+          rawCtx.fillStyle = '#000000';
+          rawCtx.fillRect(Math.max(0, fgX), fgY, Math.min(width, fgW), fgH);
+          rawCtx.restore();
+          rawCtx.save();
+          rawCtx.beginPath();
+          rawCtx.rect(0, fgY, width, fgH);
+          rawCtx.clip();
+          sample.draw(rawCtx, fgX, fgY, fgW, fgH);
+          rawCtx.restore();
+        }
+      };
+
+      const maxSrcT = Math.max(s0, srcDur - 0.04);
+      const timestamps = Array.from({ length: totalFrames }, (_, f) => Math.min(s0 + f / fps, maxSrcT));
+      const vSink = new VideoSampleSink(videoTrack);
+      let f = 0;
+      let hasFrame = false;
+      for await (const sample of vSink.samplesAtTimestamps(timestamps)) {
+        if (sample) {
+          try {
+            drawFramed(sample);
+            hasFrame = true;
+          } finally {
+            try { sample.close(); } catch { /* ignore */ }
+          }
+        } else if (!hasFrame) {
+          rawCtx.fillStyle = '#000000';
+          rawCtx.fillRect(0, 0, width, height);
+        }
+        const outT = f / fps;
+        ctx.drawImage(rawCanvas, 0, 0);
+        drawCaptions(ctx, session.captions, outT);
+        drawAvatar(ctx, session.avatar, outT, width, height);
+        const outSample = sampleFromCanvas(ctx, canvas, outT, fps);
+        await vSrc.add(outSample);
+        outSample.close();
+        f++;
+        if (f % 150 === 0 || f === totalFrames) log(`clip frame ${f}/${totalFrames}`);
+      }
+      session.slidesFrames = f;
+      session.pullPos = 0;
+      return { frames: f, ms: performance.now() - t0 };
+    } finally {
+      try { await videoInput.cancel?.(); } catch { /* ignore */ }
+      try { await audioInput?.cancel?.(); } catch { /* ignore */ }
+    }
   },
 
   async finish() {
     if (session.output2) {
-      // slideshow: attach audio, close, finalize
+      // slideshow / video clip: attach audio, close, finalize
       const buf = session.buildAudioBuffer();
       await session.aSrc2.add(buf);
       await session.aSrc2.close();
       await session.vSrc2.close();
       await session.output2.finalize();
       session.bytes = new Uint8Array(session.output2.target.buffer);
+      session.pullPos = 0;
       return { frames: session.slidesFrames, bytes: session.bytes.byteLength };
     }
     const info = await session.finish();
@@ -645,7 +866,7 @@ export const api = {
     const blob = await session.canvas.convertToBlob({ type: 'image/png' });
     const buf = new Uint8Array(await blob.arrayBuffer());
     let bin = '';
-    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, Math.min(i + 0x8000, buf.length)));
     return btoa(bin);
   },
 

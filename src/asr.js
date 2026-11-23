@@ -1,6 +1,6 @@
-// asr.js - speech recognition via phonon-2-web (github.com/unvop/phonon-2-web), replacing
-// faster-whisper tiny. The engine is a Rust/WASM port of NVIDIA Parakeet-TDT 0.6B v3 that
-// returns token-accurate word timestamps - everything captions need - running fully on-device.
+// asr.js - speech recognition via phonon-2-web (github.com/unvop/phonon-2-web), running
+// FermionResearch/Phonon-2.5-English (Rust/WASM port of quantized Parakeet-TDT 0.6B v3)
+// with token-accurate word timestamps, fully on-device.
 //
 // The WASM build lives in vendor/phonon-2-web/web/pkg-st (create it once: `npm run setup:asr`).
 // The 164 MB model is downloaded once from the Hugging Face Hub and cached in .cache/asr.
@@ -9,7 +9,10 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { ROOT } from './utils.js';
 
-const MODEL_URL = 'https://huggingface.co/FermionResearch/Phonon-2/resolve/main/phonon-2.bps.tar.zst';
+const MODEL_NAME = 'phonon-2.5-en';
+const MODEL_URL =
+  process.env.ASR_MODEL_URL ??
+  'https://huggingface.co/FermionResearch/Phonon-2.5-English/resolve/main/phonon-2.5-en.bps.tar.zst';
 
 export function asrAvailable() {
   for (const dir of ['web/pkg-st', 'web/pkg', 'web/pkg-relaxed']) {
@@ -35,9 +38,9 @@ async function loadEngine() {
   // so we compile the module explicitly.
   await glue.initSync({ module: await WebAssembly.compile(await fs.promises.readFile(path.join(pkgDir, 'phonon_wasm_bg.wasm'))) });
   const cacheDir = path.join(ROOT, '.cache', 'asr');
-  const modelPath = path.join(cacheDir, 'phonon-2.tar.zst');
+  const modelPath = path.join(cacheDir, `${MODEL_NAME}.tar.zst`);
   if (!fs.existsSync(modelPath)) {
-    console.log('[asr] downloading the Phonon-2 model (164 MB, once) ...');
+    console.log('[asr] downloading Phonon-2.5-English model (~164 MB, once) ...');
     fs.mkdirSync(cacheDir, { recursive: true });
     const res = await fetch(MODEL_URL);
     if (!res.ok) throw new Error(`model download failed: HTTP ${res.status}`);
@@ -47,10 +50,10 @@ async function loadEngine() {
   }
   const bytes = new Uint8Array(fs.readFileSync(modelPath));
   const phonon = glue.Phonon.load(bytes, null, (stage, done, total) => {
-    if (total) process.stdout.write(`\r[asr] unpacking model ${(done / 1e6).toFixed(0)}/${(total / 1e6).toFixed(0)} MB   `);
+    if (total) process.stdout.write(`\r[asr] unpacking ${MODEL_NAME} ${(done / 1e6).toFixed(0)}/${(total / 1e6).toFixed(0)} MB   `);
   });
   const info = JSON.parse(phonon.info());
-  console.log(`\n[asr] phonon-2 ready (${info.weight_bytes ? (info.weight_bytes / 1e6).toFixed(0) + ' MB weights, ' : ''}${info.threads ?? 1} thread(s))`);
+  console.log(`\n[asr] ${MODEL_NAME} ready (${info.weight_bytes ? (info.weight_bytes / 1e6).toFixed(0) + ' MB weights, ' : ''}${info.threads ?? 1} thread(s))`);
   return phonon;
 }
 

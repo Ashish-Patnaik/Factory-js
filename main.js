@@ -33,6 +33,9 @@ const EXAMPLES = `Examples:
   node main.js --auto --long --avatar                        same, with a looping talking-character gif in the corner
   node main.js --entertainment                             entertainment story (films/anime/TV/comics) -> Shorts & Reels
   node main.js --entertainment --long                      entertainment video essay -> 5-7 min YouTube long-form
+  node main.js --gta                                         latest GTA 6 clip from source-gta.md -> 9:16 + AI voiceover + hashtags
+  node main.js --gta --gta-fit blur --publish all            same with blurred widescreen 9:16 framing -> YT Shorts & IG Reels
+  node main.js --gta --gta-url https://youtu.be/...          clip a specific GTA 6 YouTube video
   node main.js --reddit --publish instagram                 reddit screenshot post: random subreddit -> AI-picked hot post -> caption -> IG feed
   node main.js --reddit --full --publish instagram          same with the full-post screenshot (--short/--snippet = truncated card)
   node main.js --reddit --video --publish all               reddit story video: screenshot + TTS voice-over -> YT Shorts + IG Reels
@@ -56,6 +59,19 @@ autonomous AI agent:
   --persona <file>          creator persona & style file (default: persona.md)
   --publish <choice>        automatically publish finished video to YouTube Shorts, Instagram Reels, or both (all) [none|youtube|instagram|all]
   --yt-privacy <choice>     YouTube Short privacy status when publishing (default: public) [public|unlisted|private]
+
+gta 6 clips:
+  --gta                     GTA 6 mode: pick a cool latest GTA 6 video from source-gta.md (@DubStepZz, @glp, @AFGuidesHD), read transcript/ASR + Most Replayed (skipping first & last 2 min), clip a hook-worthy moment to 9:16 with AI voiceover, TikTok captions & GTA 6 hashtags
+  --gta-sources <file>      channel list file (default: source-gta.md)
+  --gta-url <url>           skip channel discovery: clip this exact YouTube video URL
+  --gta-file <path>         skip YouTube: clip a local MP4 file directly
+  --gta-start <sec>         optional manual start timestamp in seconds (default: AI picks from transcript / Most Replayed / chapters)
+  --gta-fit <choice>        9:16 vertical framing [crop|blur|zoom] (default: crop)
+  --gta-game-audio <f>      ambient game audio under voiceover 0-1 (default: 0.12; 0 = voiceover only)
+  --gta-max-video <n>       max source YouTube video duration in seconds during discovery (default: 2400)
+  --gta-trim-margin <sec>   skip first & last N seconds to avoid intros/outros (default: 120 = 2 min)
+  --gta-no-asr              skip on-device ASR fallback when a YouTube video has no captions
+  --yt-dlp-path <p>         explicit path to yt-dlp(.exe)
 
 reddit (the b.mjs integration):
   --reddit                  reddit mode: pick a random subreddit from sources_reddit.md, read its hot section, let the AI pick the post it likes, capture a clean b.mjs-style screenshot and write a persona caption (with --publish instagram it goes out as an Instagram FEED image post, not a reel)
@@ -117,7 +133,7 @@ narration (omit all of these for a plain scroll video):
   --text-file <p>           read the text to speak from a file
   --enhance                 AI rewrites --text/--text-file into an engaging hook script
   --prompt <t>              extra instructions for the AI (tone, focus, audience...)
-  --script-seconds <n>      AI script length target (default 60; with --long: 360, up to 600)
+  --script-seconds <n>      AI script length target (default 60; with --long: 360, up to 600; with --gta: 35)
   --script-only             print/save the script and stop (no audio/video)
   --scraper <choice>        [obscura|chromium] (default: obscura)
   --obscura-path <p>        path to obscura(.exe); also used by --browser obscura
@@ -225,7 +241,7 @@ function parse() {
             case '--text-file': g.text_file = next(); break;
             case '--enhance': g.enhance = true; break;
             case '--prompt': g.prompt = next(); break;
-            case '--script-seconds': g.script_seconds = parseInt(next(), 10); break;
+            case '--script-seconds': g.script_seconds = parseInt(next(), 10); g.script_seconds_given = true; break;
             case '--script-only': g.script_only = true; break;
             case '--scraper': g.scraper = next(); if (!['obscura', 'chromium'].includes(g.scraper)) choicesErr(a, g.scraper, ['obscura', 'chromium']); break;
             case '--obscura-path': g.obscura_path = next(); break;
@@ -260,6 +276,17 @@ function parse() {
             case '--post-url': g.post_url = next(); break;
             case '--reddit-cookie': g.reddit_cookie = next(); break;
             case '--image-url': g.image_url = next(); break;
+            case '--gta': g.gta = true; break;
+            case '--gta-sources': g.gta_sources = next(); break;
+            case '--gta-url': g.gta_url = next(); break;
+            case '--gta-file': g.gta_file = next(); break;
+            case '--gta-start': g.gta_start = parseFloat(next()); break;
+            case '--gta-fit': g.gta_fit = next(); if (!['crop', 'blur', 'zoom'].includes(g.gta_fit)) choicesErr(a, g.gta_fit, ['crop', 'blur', 'zoom']); break;
+            case '--gta-game-audio': g.gta_game_audio = parseFloat(next()); break;
+            case '--gta-max-video': g.gta_max_video = parseInt(next(), 10); break;
+            case '--gta-trim-margin': g.gta_trim_margin = parseInt(next(), 10); break;
+            case '--gta-no-asr': g.gta_no_asr = true; break;
+            case '--yt-dlp-path': g.yt_dlp_path = next(); break;
             default: die(`unknown argument: ${a}\n${EXAMPLES}`);
           }
         } else if (url === null) url = a;
@@ -298,6 +325,33 @@ function parse() {
       ['--post-url', g.post_url], ['--reddit-cookie', g.reddit_cookie], ['--image-url', g.image_url],
     ]) {
       if (val) die(`${flag} works with --reddit only`);
+    }
+  }
+  if (g.gta) {
+    if (g.auto || g.entertainment || g.reddit || g.long || g.image) {
+      die('--gta is a standalone 9:16 clip mode and cannot be combined with --auto, --entertainment, --reddit, --long, or --image');
+    }
+    if (g.gta_game_audio !== undefined && !(0 <= g.gta_game_audio && g.gta_game_audio <= 1)) {
+      die('--gta-game-audio must be between 0 and 1');
+    }
+    if (g.gta_trim_margin !== undefined && !(g.gta_trim_margin >= 0)) {
+      die('--gta-trim-margin must be >= 0');
+    }
+    if (g.gta_start !== undefined && !(g.gta_start >= 0)) {
+      die('--gta-start must be >= 0');
+    }
+    if (g.gta_max_video !== undefined && !(g.gta_max_video >= 30)) {
+      die('--gta-max-video must be >= 30');
+    }
+    if (!g.script_seconds_given) g.script_seconds = 35; // punchy ~35s viral Short by default
+  } else {
+    for (const [flag, val] of [
+      ['--gta-sources', g.gta_sources], ['--gta-url', g.gta_url], ['--gta-file', g.gta_file],
+      ['--gta-start', g.gta_start !== undefined], ['--gta-fit', g.gta_fit],
+      ['--gta-game-audio', g.gta_game_audio !== undefined], ['--gta-max-video', g.gta_max_video],
+      ['--gta-trim-margin', g.gta_trim_margin !== undefined], ['--gta-no-asr', g.gta_no_asr],
+    ]) {
+      if (val) die(`${flag} works with --gta only`);
     }
   }
   if (g.reddit_video && g.video_style && !['scroll', 'card'].includes(g.video_style)) {
@@ -344,7 +398,7 @@ function parse() {
     if (!(g.width && g.height)) die('--width and --height must be given together');
     [w, h] = [g.width, g.height];
   } else {
-    [w, h] = RATIOS[g.long ? '16:9' : ((narrating || g.mobile) ? '9:16' : '16:9')];
+    [w, h] = RATIOS[g.long ? '16:9' : ((narrating || g.mobile || g.gta) ? '9:16' : '16:9')];
   }
   if (w % 2 || h % 2 || w < 16 || h < 16) die('width/height must be even numbers >= 16 (H.264 yuv420p)');
   if ((g.mode === 'virtual' || g.mode === 'tiles') && g.browser === 'obscura') {
@@ -406,6 +460,9 @@ function parse() {
     avatar_corner: g.avatar_corner, avatar_size: g.avatar_size,
     image: g.image, image_dir: g.image_dir ?? null, image_limit: g.image_limit,
     slide_seconds: g.slide_seconds, image_sources: g.image_sources, kenburns: g.kenburns,
+    gta: Boolean(g.gta), gta_sources: g.gta_sources ?? 'source-gta.md',
+    gta_fit: g.gta_fit ?? 'crop', gta_game_audio: g.gta_game_audio ?? 0.12,
+    yt_dlp_path: g.yt_dlp_path ?? null,
     encoder_channel: g.encoder_channel ?? null,
   });
   return { cfg, g };
@@ -666,6 +723,12 @@ async function main() {
       // The reddit pipeline is self-contained: discovery -> screenshot -> caption/video -> publish.
       const reddit = await import('./src/reddit.js');
       await reddit.runRedditFlow(cfg, g, work, { renderVideo: (vcfg) => run(vcfg, work) });
+      return;
+    }
+    if (g.gta) {
+      // The GTA 6 pipeline is self-contained: channel discovery -> transcript/ASR -> 9:16 clip -> publish.
+      const gta = await import('./src/gta.js');
+      await gta.runGtaFlow(cfg, g, work);
       return;
     }
     if (g.auto || g.publish !== 'none') {

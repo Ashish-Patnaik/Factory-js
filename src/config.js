@@ -43,7 +43,7 @@ export function defaultConfig(overrides = {}) {
     obscura_path: null,
     reddit_cookie: null,   // --reddit-cookie / REDDIT_SESSION_COOKIE (logged-in session skips Reddit's anti-bot wall)
     private_net: false,
-    llm_model: 'gemini-3.5-flash-lite',
+    llm_model: 'gemini-3.6-flash',
     voice: 'Easton',
     tts_model: 'hf://gradium/phonon-31m-en',
     tts_quant: 'q8',       // phonon-tts wasm offers q8 | f32 (q4k requests are mapped to q8)
@@ -72,6 +72,12 @@ export function defaultConfig(overrides = {}) {
     cap_caps: true,
     separate: false,
     keep_files: false,
+    // --- gta 6 clips (--gta)
+    gta: false,
+    gta_sources: 'source-gta.md',
+    gta_fit: 'crop',       // crop | blur | zoom
+    gta_game_audio: 0.12,  // 0..1 ambient game audio under voiceover
+    yt_dlp_path: null,
     ...overrides,
   };
 }
