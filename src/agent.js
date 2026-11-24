@@ -45,8 +45,7 @@ function extractJson(raw) {
   return JSON.parse(m ? m[0] : s);
 }
 
-export async function discoverBestUrl(cfg, sourcesFile = 'sources.md', pickRandom = false) {
-  // Surf hub URLs in sources.md (or just 1 random hub if --random), collect nested links, and pick the best story.
+export async function discoverBestUrl(cfg, sourcesFile = 'sources.md', pickRandom = false, excludeUrls = new Set()) {
   checkLlm();
   let hubs = parseSources(sourcesFile);
   const history = loadHistory();
@@ -54,65 +53,40 @@ export async function discoverBestUrl(cfg, sourcesFile = 'sources.md', pickRando
 
   if (pickRandom) {
     hubs = [...hubs].sort(() => Math.random() - 0.5);
-    console.log(`[agent] --random active: picked random source hub -> ${hubs[0]}`);
+    console.log(`[agent] --random active: shuffled ${hubs.length} source hubs (starting with ${hubs[0]})`);
   }
 
-  const candidates = [];
-  const seen = new Set(history);
-  for (const hub of hubs) {
-    console.log(`[agent] surfing hub: ${hub}`);
-    let nested = [];
-    try {
-      nested = await pageLinks(cfg, hub);
-    } catch (e) {
-      console.log(`[agent] hub unreachable (${String(e?.message ?? e).split('\n')[0]}), skipping to the next hub`);
-      continue;
+  const seen = new Set([...history, ...excludeUrls]);
+
+  // Helper: pick & verify a readable candidate from a batch of links
+  const pickReadableFromBatch = async (batch) => {
+    if (!batch.length) return null;
+
+    const listing = batch.slice(0, 120)
+      .map((c, i) => `${i}. [${c.title}](${c.url}) (from ${c.source_hub})`).join('\n');
+
+    const longform = cfg.script_seconds > 90;
+    const fmt = longform ? 'long-form 16:9 YouTube video (5-7 minutes)' : 'vertical short-form video (YouTube Shorts & Instagram Reels)';
+    const view = longform ? 'desktop view' : 'mobile view';
+
+    let arena, focus;
+    if (cfg.entertainment) {
+      arena = 'entertainment (films, TV shows, anime, comics)';
+      focus = '1. Represent a genuinely exciting entertainment story: film/TV/anime/comics news, trailers, plot ' +
+        'moments, character arcs, release dates, fan theories or strong opinions worth sharing.\n' +
+        '2. Have rich story text on the landing page (plot summary, moments, quotes, opinions) so there is ' +
+        'plenty of material to narrate.\n' +
+        '3. Prefer recognizable titles and stories that can naturally be connected to a positive mindset, ' +
+        'good habits or a clear lesson for the viewer.';
+    } else {
+      arena = 'tech';
+      focus = '1. Represent a genuinely exciting, newly trending repo, tool, engineering deep-dive, major AI/tech ' +
+        'story, or a big tech-meets-entertainment story (AI in films, streaming tech, anime industry...).\n' +
+        `2. Have rich visual/text content on the landing page that will look great when scrolled in ${view}.\n` +
+        '3. Avoid generic homepages, login walls, or thin discussion threads without substance.';
     }
-    let added = 0;
-    for (const item of nested) {
-      const u = item.url;
-      if (!seen.has(u)) {
-        seen.add(u);
-        candidates.push(item);
-        added += 1;
-      }
-      if (added >= 25) break; // cap per hub so token usage stays tiny
-    }
-    if (!nested.length && !seen.has(hub)) candidates.push({ url: hub, title: hub, source_hub: hub });
 
-    // If --random is set, stop as soon as we have fresh candidates from the single randomly chosen hub
-    if (pickRandom && candidates.length) break;
-  }
-
-  if (!candidates.length) {
-    throw new Error('No new candidate URLs found across sources (or all have been posted already).');
-  }
-
-  const listing = candidates.slice(0, 120)
-    .map((c, i) => `${i}. [${c.title}](${c.url}) (from ${c.source_hub})`).join('\n');
-
-  const longform = cfg.script_seconds > 90; // --long mode
-  const fmt = longform ? 'long-form 16:9 YouTube video (5-7 minutes)' : 'vertical short-form video (YouTube Shorts & Instagram Reels)';
-  const view = longform ? 'desktop view' : 'mobile view';
-
-  let arena, focus;
-  if (cfg.entertainment) {
-    arena = 'entertainment (films, TV shows, anime, comics)';
-    focus = '1. Represent a genuinely exciting entertainment story: film/TV/anime/comics news, trailers, plot ' +
-      'moments, character arcs, release dates, fan theories or strong opinions worth sharing.\n' +
-      '2. Have rich story text on the landing page (plot summary, moments, quotes, opinions) so there is ' +
-      'plenty of material to narrate.\n' +
-      '3. Prefer recognizable titles and stories that can naturally be connected to a positive mindset, ' +
-      'good habits or a clear lesson for the viewer.';
-  } else {
-    arena = 'tech';
-    focus = '1. Represent a genuinely exciting, newly trending repo, tool, engineering deep-dive, major AI/tech ' +
-      'story, or a big tech-meets-entertainment story (AI in films, streaming tech, anime industry...).\n' +
-      `2. Have rich visual/text content on the landing page that will look great when scrolled in ${view}.\n` +
-      '3. Avoid generic homepages, login walls, or thin discussion threads without substance.';
-  }
-
-  const prompt = `You are an autonomous ${arena} content director scouting for the most viral, high-signal topic for a ${fmt}.
+    const prompt = `You are an autonomous ${arena} content director scouting for the most viral, high-signal topic for a ${fmt}.
 
 Creator Persona:
 ${persona}
@@ -126,36 +100,99 @@ ${focus}
 Return ONLY valid JSON in this exact format:
 {"picks": [0, 5, 12], "reason": "One sentence explaining why the #1 pick is the best hook."}`;
 
-  const data = extractJson(await llm(cfg, prompt));
-  let picks = (data.picks ?? []).filter((p) => Number.isInteger(p) && p >= 0 && p < candidates.length);
-  if (!picks.length) picks = [0];
+    const data = extractJson(await llm(cfg, prompt));
+    let picks = (data.picks ?? []).filter((p) => Number.isInteger(p) && p >= 0 && p < batch.length);
+    if (!picks.length) picks = [0];
 
-  console.log(`[agent] AI selection reason: ${data.reason ?? 'Top trending topic'}`);
-  for (const idx of picks) {
-    const chosen = candidates[idx];
-    const url = chosen.url;
-    console.log(`[agent] inspecting selected URL: ${url} (${chosen.title})`);
+    console.log(`[agent] AI selection reason: ${data.reason ?? 'Top trending topic'}`);
+    for (const idx of picks) {
+      const chosen = batch[idx];
+      console.log(`[agent] inspecting selected URL: ${chosen.url} (${chosen.title})`);
+      try {
+        const content = await pageText(cfg, chosen.url);
+        if (content.length >= 250) return { url: chosen.url, title: chosen.title, content };
+        console.log(`[agent] page had too little readable text (${content.length} chars), trying next pick...`);
+      } catch (e) {
+        console.log(`[agent] failed to read ${chosen.url} (${String(e?.message ?? e).split('\n')[0]}), trying next pick...`);
+      }
+    }
+
+    const tried = new Set(picks.map((p) => batch[p]));
+    for (const c of batch.filter((x) => !tried.has(x)).slice(0, 10)) {
+      try {
+        const content = await pageText(cfg, c.url);
+        if (content.length >= 250) {
+          console.log(`[agent] AI picks unreadable; fell back to ${c.url} (${c.title})`);
+          return { url: c.url, title: c.title, content };
+        }
+      } catch { /* try next candidate */ }
+    }
+    return null;
+  };
+
+  if (pickRandom) {
+    // Walk shuffled hubs one-by-one: if a hub is empty, rate-limited, or anti-bot protected,
+    // seamlessly continue to the next hub instead of dying.
+    for (const hub of hubs) {
+      console.log(`[agent] surfing hub: ${hub}`);
+      let nested = [];
+      try {
+        nested = await pageLinks(cfg, hub);
+      } catch (e) {
+        console.log(`[agent] hub unreachable (${String(e?.message ?? e).split('\n')[0]}), trying next hub...`);
+        continue;
+      }
+
+      const hubCandidates = [];
+      for (const item of nested) {
+        if (!seen.has(item.url)) {
+          seen.add(item.url);
+          hubCandidates.push(item);
+        }
+        if (hubCandidates.length >= 25) break;
+      }
+
+      if (!hubCandidates.length) {
+        console.log(`[agent] no fresh nested links found on ${hub}, trying next hub...`);
+        continue;
+      }
+
+      const winner = await pickReadableFromBatch(hubCandidates);
+      if (winner) return winner;
+      console.log(`[agent] no readable candidate from ${hub}, trying next hub...`);
+    }
+    throw new Error('no readable candidate found across any hub in sources.md');
+  }
+
+  // Non-random mode: gather candidates across all hubs first
+  const candidates = [];
+  for (const hub of hubs) {
+    console.log(`[agent] surfing hub: ${hub}`);
+    let nested = [];
     try {
-      const content = await pageText(cfg, url);
-      if (content.length >= 250) return { url, title: chosen.title, content };
-      console.log(`[agent] page had too little readable text (${content.length} chars), trying next pick...`);
+      nested = await pageLinks(cfg, hub);
     } catch (e) {
-      console.log(`[agent] failed to read ${url} (${e}), trying next pick...`);
+      console.log(`[agent] hub unreachable (${String(e?.message ?? e).split('\n')[0]}), skipping to the next hub`);
+      continue;
+    }
+    let added = 0;
+    for (const item of nested) {
+      if (!seen.has(item.url)) {
+        seen.add(item.url);
+        candidates.push(item);
+        added += 1;
+      }
+      if (added >= 25) break;
     }
   }
 
-  // All AI picks were unreadable (empty pages or anti-bot challenges): walk a few more
-  // candidates linearly instead of dying on the first pick.
-  const tried = new Set(picks.map((p) => candidates[p]));
-  for (const c of candidates.filter((x) => !tried.has(x)).slice(0, 12)) {
-    try {
-      const content = await pageText(cfg, c.url);
-      if (content.length >= 250) {
-        console.log(`[agent] AI picks unreadable; fell back to ${c.url} (${c.title})`);
-        return { url: c.url, title: c.title, content };
-      }
-    } catch { /* challenged or empty - try the next candidate */ }
+  if (!candidates.length) {
+    throw new Error('No new candidate URLs found across sources (or all have been posted already).');
   }
+
+  const winner = await pickReadableFromBatch(candidates);
+  if (winner) return winner;
+
   throw new Error('no readable candidate found (anti-bot challenges or empty pages everywhere) - ' +
     'add more sources to sources.md or drop the protected ones');
 }

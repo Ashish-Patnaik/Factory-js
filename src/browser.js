@@ -7,6 +7,9 @@ import { ev, parseRedditCookies } from './utils.js';
 export const MOBILE_UA =
   'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 ' +
   '(KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36';
+export const DESKTOP_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
 // GPU is used when available; otherwise Chromium falls back to software (SwiftShader) WebGL.
 export const ARGS = [
@@ -14,6 +17,7 @@ export const ARGS = [
   '--autoplay-policy=no-user-gesture-required', '--mute-audio', '--hide-scrollbars',
   '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
   '--disable-backgrounding-occluded-windows',
+  '--disable-blink-features=AutomationControlled',
 ];
 
 export const SETTLE_JS = `() => {
@@ -106,9 +110,8 @@ async step(y,elapsed,ts){
 
 function contextOpts(cfg, vw, vh) {
   if (!cfg.mobile) {
-    return { viewport: { width: vw, height: vh }, deviceScaleFactor: 1 };
+    return { viewport: { width: vw, height: vh }, deviceScaleFactor: 1, userAgent: DESKTOP_UA, locale: 'en-US' };
   }
-  // Scale up so the captured frame matches (or exceeds) the output video resolution natively.
   const dpr = Math.max(1, Math.ceil(Math.max(cfg.width / vw, cfg.height / vh)));
   return {
     viewport: { width: vw, height: vh },
@@ -117,6 +120,7 @@ function contextOpts(cfg, vw, vh) {
     isMobile: true,
     hasTouch: true,
     userAgent: MOBILE_UA,
+    locale: 'en-US',
   };
 }
 
@@ -163,6 +167,7 @@ export class Browser {
   async newPage(vw, vh) {
     const ctx = await this.browser.newContext(contextOpts(this.cfg, vw, vh));
     await applyRedditCookies(ctx, this.cfg);
+    try { await ctx.addInitScript('Object.defineProperty(navigator, "webdriver", { get: () => undefined });'); } catch { /* ignore */ }
     try { await ctx.addInitScript(POPUP_KILLER_JS); } catch { /* ignore */ }
     if (this.cfg.mode === 'virtual') {
       try { await ctx.addInitScript(SHIM_JS); } catch { /* ignore */ }

@@ -569,9 +569,7 @@ async function run(cfg, work) {
     if (!cfg.speed) cfg.duration = Math.max(secs - 1 / cfg.fps, 0.1);
     if (!cfg.long) {
       // Hard-cap the final video at the Instagram API reel limit (90 s; the in-app 3-min
-      // limit does NOT apply to API publishing). Nothing upstream bounded the voice-over:
-      // a long AI script -> a >90 s video -> Meta's transcoder kills it after a full
-      // 20+ MB upload with ProcessingFailedError. REEL_MAX_SECONDS leaves a 1 s margin.
+      // limit does NOT apply to API publishing). REEL_MAX_SECONDS leaves a 1 s margin.
       // (--long is exempt: it is the 5-7 min YouTube long-form mode.)
       const reelMax = Number(process.env.REEL_MAX_SECONDS ?? '89');
       if (secs + cfg.start_delay + cfg.pause > reelMax) {
@@ -616,25 +614,44 @@ async function run(cfg, work) {
     await encoder.setAudio(cfg.separate ? null : wav, { audioDelay: cfg.start_delay, totalDuration: 0 });
     await encoder.begin();
 
-    br = await new Br(cfg).open();
-    const page = await br.newPage(vw, vh);
-    await br.load(page);
+    // Load page and detect anti-bot interstitials; if stock Chromium is blocked and
+    // Obscura is installed, automatically retry the render using Obscura.
+    let activeMode = cfg.mode;
+    const loadAndCheck = async (BrowserCls) => {
+      br = await new BrowserCls(cfg).open();
+      const pg = await br.newPage(vw, vh);
+      await br.load(pg);
+      const { looksLikeChallenge } = await import('./src/scrape.js');
+      const probePage = await ev(pg,
+        '() => ({ t: document.title || "", b: document.body ? String(document.body.innerText).slice(0, 600) : "" })').catch(() => null);
+      return { page: pg, blocked: Boolean(probePage && looksLikeChallenge(probePage.t, probePage.b)) };
+    };
+
+    let { page, blocked } = await loadAndCheck(Br);
+
+    if (blocked && cfg.browser === 'chromium') {
+      const { findObscura } = await import('./src/scrape.js');
+      if (findObscura(cfg.obscura_path)) {
+        console.log('[browser] Chromium hit anti-bot verification; retrying render with Obscura...');
+        await br.close();
+        br = null;
+        activeMode = 'stepped';
+        ({ page, blocked } = await loadAndCheck(ObscuraBrowser));
+      }
+    }
+
+    if (blocked) {
+      throw Object.assign(
+        new Error('this site serves an anti-bot verification page instead of content - skipping URL'),
+        { antiBot: true },
+      );
+    }
+
     const [aw, ah] = await ev(page, '() => [window.innerWidth, window.innerHeight]');
     if (aw !== vw || ah !== vh) {
       console.log(`warning: viewport is ${aw}x${ah}, requested ${vw}x${vh}; the encoder will fit it without stretching`);
     }
-    // Refuse to film an anti-bot challenge page (Imperva/Cloudflare/DataDome "verify you
-    // are human" interstitials): a fast, clear failure beats a 40-minute render of a
-    // security screen that would then get published.
-    {
-      const { looksLikeChallenge } = await import('./src/scrape.js');
-      const probePage = await ev(page,
-        '() => ({ t: document.title || "", b: document.body ? String(document.body.innerText).slice(0, 400) : "" })').catch(() => null);
-      if (probePage && looksLikeChallenge(probePage.t, probePage.b)) {
-        die('this site serves an anti-bot verification page instead of content - the video would just film it. ' +
-          'Try another URL, or use --browser obscura (some sites only block stock headless Chrome).');
-      }
-    }
+
     if (cfg.reddit_style) {
       // --reddit --video (scroll style): turn the live post page into the clean b.mjs card first
       const { styleRedditPage } = await import('./src/reddit.js');
@@ -670,12 +687,11 @@ async function run(cfg, work) {
     }
     console.log(`page scroll range ${maxY}px, ${nOut ?? ys.length} frames (${((nOut ?? ys.length) / cfg.fps).toFixed(1)}s) at ${cfg.fps}fps`);
     const rec = { page, ys, encoder, cfg, cache: work };
-    const wantTiles = cfg.mode === 'tiles' ||
-      (cfg.mode === 'virtual' && String(process.env.RENDER_TILED ?? '1') !== '0');
+    const wantTiles = activeMode === 'tiles' ||
+      (activeMode === 'virtual' && String(process.env.RENDER_TILED ?? '1') !== '0');
     if (wantTiles) {
-      // Snapshot-tile capture: one page pass + local composition, immune to slow/heavy pages
-      // (the "--entertainment renders for 40 minutes" bug). Failures before the first encoded
-      // frame fall back to the live virtual-time capture; mid-render failures are fatal.
+      // Snapshot-tile capture: one page pass + local composition, immune to slow/heavy pages.
+      // Failures before the first encoded frame fall back to live virtual-time capture; mid-render failures are fatal.
       try {
         st = await recordTiled({ ...rec, nOut });
       } catch (e) {
@@ -683,11 +699,12 @@ async function run(cfg, work) {
         console.log(`note: tile snapshot capture unavailable (${String(e?.message ?? e).split('\n')[0]}); using live virtual-time capture`);
         st = await recordVirtual({ ...rec, nOut });
       }
-    } else if (cfg.mode === 'virtual') st = await recordVirtual({ ...rec, nOut });
-    else if (cfg.mode === 'stepped') st = await recordStepped({ ...rec, nOut });
+    } else if (activeMode === 'virtual') st = await recordVirtual({ ...rec, nOut });
+    else if (activeMode === 'stepped') st = await recordStepped({ ...rec, nOut });
     else st = await recordRealtime(rec);
   } catch (e) {
     await encoder.abort();
+    if (e?.antiBot) throw e; // let --auto in main() retry with another candidate URL
     die(String(e?.message ?? e).split('\n')[0] || 'browser error (crash or timeout)');
   } finally {
     if (br) await br.close();
@@ -734,30 +751,56 @@ async function main() {
     if (g.auto || g.publish !== 'none') {
       const agent = await import('./src/agent.js');
       const { pageText } = await import('./src/scrape.js');
-      let content;
-      if (!cfg.url) {
-        const found = await agent.discoverBestUrl(cfg, g.sources, g.random);
-        cfg.url = found.url;
-        content = found.content;
-      } else {
-        content = await pageText(cfg, cfg.url);
-      }
-      console.log(`[agent] generating persona script & social metadata for ${cfg.url}`);
-      pkg = await agent.generateContentPackage(cfg, cfg.url, content);
-      cfg.text = pkg.script;
-      cfg.narrate = false;
-      if (!g.name && !g.output && pkg.slug) {
-        const slug = pkg.slug.replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
-        cfg.output = path.join('output', `${slug}.mp4`);
-      }
-      metaPath = cfg.output.replace(/\.mp4$/i, '') + '.meta.json';
-      fs.writeFileSync(metaPath, JSON.stringify(pkg, null, 2));
-      console.log(`[agent] metadata saved to ${metaPath}`);
-      console.log(`  YT Title : ${pkg.youtube.title}`);
-      if (pkg.instagram) console.log(`  IG Hook  : ${pkg.instagram.title}`);
-    }
+      const explicitUrl = Boolean(cfg.url);
+      const baseOutput = cfg.output;
+      const baseSpeed = cfg.speed;
+      const baseDuration = cfg.duration;
+      const excludeUrls = new Set();
+      const maxAttempts = explicitUrl ? 1 : 3;
 
-    await run(cfg, work);
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        let content;
+        if (!explicitUrl) {
+          const found = await agent.discoverBestUrl(cfg, g.sources, g.random, excludeUrls);
+          cfg.url = found.url;
+          content = found.content;
+        } else {
+          content = await pageText(cfg, cfg.url);
+        }
+        console.log(`[agent] generating persona script & social metadata for ${cfg.url}`);
+        pkg = await agent.generateContentPackage(cfg, cfg.url, content);
+        cfg.text = pkg.script;
+        cfg.narrate = false;
+        cfg.output = baseOutput;
+        cfg.speed = baseSpeed;
+        cfg.duration = baseDuration;
+        if (!g.name && !g.output && pkg.slug) {
+          const slug = pkg.slug.replace(/[^\w.-]+/g, '_').replace(/^_+|_+$/g, '').slice(0, 50);
+          cfg.output = path.join('output', `${slug}.mp4`);
+        }
+        metaPath = cfg.output.replace(/\.mp4$/i, '') + '.meta.json';
+        fs.writeFileSync(metaPath, JSON.stringify(pkg, null, 2));
+        console.log(`[agent] metadata saved to ${metaPath}`);
+        console.log(`  YT Title : ${pkg.youtube.title}`);
+        if (pkg.instagram) console.log(`  IG Hook  : ${pkg.instagram.title}`);
+
+        try {
+          await run(cfg, work);
+          break; // rendered cleanly
+        } catch (e) {
+          if (e?.antiBot && attempt < maxAttempts) {
+            console.log(`[agent] ${cfg.url} blocked during render (${e.message}); trying another candidate (${attempt}/${maxAttempts})...`);
+            excludeUrls.add(cfg.url);
+            if (metaPath && fs.existsSync(metaPath)) fs.rmSync(metaPath, { force: true });
+            cfg.url = '';
+            continue;
+          }
+          throw e;
+        }
+      }
+    } else {
+      await run(cfg, work);
+    }
 
     if (pkg && !cfg.script_only) {
       const agent = await import('./src/agent.js');

@@ -72,14 +72,12 @@ function challengeError(url) {
 }
 
 export function findObscura(explicit = null) {
-  // Locate OS-appropriate obscura binary: .exe on Windows, 'obscura' on Linux/macOS.
   const isWin = os.platform() === 'win32';
   const names = isWin ? ['obscura.exe', 'obscura.exe.exe'] : ['obscura'];
 
   const ready = (p) => {
     const full = path.resolve(p);
     if (!isWin) {
-      // Ensure the Linux binary and its worker have executable permissions (chmod +x)
       const folder = path.dirname(full);
       for (const fn of ['obscura', 'obscura-worker']) {
         const fp = path.join(folder, fn);
@@ -92,29 +90,34 @@ export function findObscura(explicit = null) {
   };
 
   const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } };
+  const isDir = (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } };
 
-  if (explicit) {
-    if (fs.existsSync(explicit) && fs.statSync(explicit).isDirectory()) {
+  const checkPathOrDir = (target) => {
+    if (!target) return null;
+    if (isDir(target)) {
       for (const n of names) {
-        const cand = path.join(explicit, n);
+        const cand = path.join(target, n);
         if (isFile(cand)) return ready(cand);
       }
-    } else if (isFile(explicit)) return ready(explicit);
-  }
+    } else if (isFile(target)) {
+      return ready(target);
+    }
+    return null;
+  };
 
-  const envP = process.env.OBSCURA_PATH;
-  if (envP && isFile(envP)) return ready(envP);
+  const hitExplicit = checkPathOrDir(explicit);
+  if (hitExplicit) return hitExplicit;
+
+  const hitEnv = checkPathOrDir(process.env.OBSCURA_PATH);
+  if (hitEnv) return hitEnv;
 
   const roots = [ROOT, process.cwd()];
   for (const r of roots) {
-    for (const d of ['obscura', '.']) {
+    for (const d of ['.cache/obscura', 'obscura', '.']) {
       const base = path.join(r, d);
-      for (const n of names) {
-        const cand = path.join(base, n);
-        if (isFile(cand)) return ready(cand);
-      }
-      // Also walk one level deeper in case zip/tar extracted to a subfolder inside obscura/
-      if (d === 'obscura' && fs.existsSync(base) && fs.statSync(base).isDirectory()) {
+      const direct = checkPathOrDir(base);
+      if (direct) return direct;
+      if ((d === 'obscura' || d === '.cache/obscura') && isDir(base)) {
         const walk = (dir, depth) => {
           if (depth > 2) return null;
           for (const f of fs.readdirSync(dir)) {
@@ -134,10 +137,14 @@ export function findObscura(explicit = null) {
     }
   }
 
-  const whichP = process.platform === 'win32'
-    ? null // shutil.which equivalent; rely on PATH resolution by spawn
-    : '/usr/bin/obscura';
-  if (!isWin && whichP && isFile(whichP)) return ready(whichP);
+  // Scan PATH + standard Unix bin dirs
+  const pathDirs = (process.env.PATH ?? '').split(path.delimiter).filter(Boolean);
+  if (!isWin) pathDirs.push('/usr/local/bin', '/usr/bin');
+  for (const dir of pathDirs) {
+    const hit = checkPathOrDir(dir);
+    if (hit) return hit;
+  }
+
   return null;
 }
 
@@ -154,10 +161,22 @@ function clean(d, limit = 12000) {
   const head = `Title: ${d.title}\n` + (d.desc ? `Description: ${d.desc}\n` : '');
   return (head + lines.join('\n')).slice(0, limit);
 }
+const DESKTOP_UA =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+
+async function safeGoto(page, url, timeoutMs) {
+  try {
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: timeoutMs });
+    await page.waitForLoadState('load', { timeout: Math.min(timeoutMs, 10000) }).catch(() => {});
+  } catch (e) {
+    if (!String(e).includes('Timeout')) throw e;
+  }
+}
 
 async function visit(page, cfg, url = null) {
   const target = url ?? cfg.url;
-  await page.goto(target, { waitUntil: 'load', timeout: cfg.timeout * 1000 });
+  await safeGoto(page, target, cfg.timeout * 1000);
   await page.waitForTimeout(Math.max(cfg.wait, 1.5) * 1000);
   const d = await ev(page, EXTRACT_JS);
   if (looksLikeChallenge(d.title, d.text)) throw challengeError(target);
@@ -165,7 +184,7 @@ async function visit(page, cfg, url = null) {
 }
 
 async function visitLinks(page, cfg, url) {
-  await page.goto(url, { waitUntil: 'load', timeout: cfg.timeout * 1000 });
+  await safeGoto(page, url, cfg.timeout * 1000);
   await page.waitForTimeout(Math.max(cfg.wait, 1.5) * 1000);
   const d = await ev(page, EXTRACT_JS);
   if (looksLikeChallenge(d.title, d.text)) throw challengeError(url);
@@ -224,9 +243,19 @@ async function withObscura(cfg, exe, fn) {
 }
 
 async function withChromium(cfg, fn) {
-  const browser = await chromium.launch({ headless: true, ...(cfg.channel ? { channel: cfg.channel } : {}) });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-blink-features=AutomationControlled'],
+    ...(cfg.channel ? { channel: cfg.channel } : {}),
+  });
   try {
-    return await fn(await browser.newPage());
+    const ctx = await browser.newContext({
+      userAgent: DESKTOP_UA,
+      viewport: { width: 1366, height: 768 },
+      locale: 'en-US',
+    });
+    await ctx.addInitScript('Object.defineProperty(navigator, "webdriver", { get: () => undefined });');
+    return await fn(await ctx.newPage());
   } finally {
     try { await browser.close(); } catch { /* ignore */ }
   }
