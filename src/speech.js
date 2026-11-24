@@ -2,7 +2,7 @@
 import fs from 'node:fs';
 import { Word, ensureFont } from './captions.js';
 import { checkLlm, llm } from './gemini.js';
-import { PhononTTS, readWav } from './tts.js';
+import { TinyVocaTTS, readWav } from './tts.js';
 import * as asr from './asr.js';
 
 export const WPS = 2.5; // initial guess: spoken words per second (re-measured after the first TTS pass)
@@ -93,7 +93,7 @@ export async function writeScript(cfg, page, words) {
 
 export async function synthesize(cfg, text, wav) {
   const key = [cfg.tts_model, cfg.tts_lang, cfg.tts_quant].join('|');
-  if (!ttsCache.has(key)) ttsCache.set(key, await PhononTTS.load(cfg));
+  if (!ttsCache.has(key)) ttsCache.set(key, await TinyVocaTTS.load(cfg));
   const tts = ttsCache.get(key);
   return tts.save(wav, text, { voice: cfg.voice });
 }

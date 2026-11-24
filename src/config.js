@@ -45,8 +45,8 @@ export function defaultConfig(overrides = {}) {
     private_net: false,
     llm_model: 'gemini-3.6-flash',
     voice: 'Easton',
-    tts_model: 'hf://gradium/phonon-31m-en',
-    tts_quant: 'q8',       // phonon-tts wasm offers q8 | f32 (q4k requests are mapped to q8)
+    tts_model: 'hf://n4ze3m/tiny-voca',
+    tts_quant: 'js',       // TinyVocaTTS wasm offers q8 | f32 (q4k requests are mapped to q8)
     tts_lang: 'en',
     whisper_model: 'tiny', // compat flag: phonon-2-web replaces whisper (value is ignored)
     // --- talking avatar (--avatar)

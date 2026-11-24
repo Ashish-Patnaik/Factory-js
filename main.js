@@ -139,9 +139,9 @@ narration (omit all of these for a plain scroll video):
   --obscura-path <p>        path to obscura(.exe); also used by --browser obscura
   --allow-private-network   let Obscura read localhost/LAN URLs
   --llm-model <m>           (default: gemini-3.5-flash-lite)
-  --voice <v>               (default: Easton)
-  --tts-model <m>           (default: hf://gradium/phonon-31m-en)
-  --tts-quant <q>           (default: q8; q4k maps to q8)
+  --voice <v>               (default: M2; choices: M2, F2)
+  --tts-model <m>           (default: hf://n4ze3m/tiny-voca)
+  --tts-quant <q>           (default: js; q4k maps to q8)
   --tts-lang <l>            (default: en)
   --whisper-model <m>       compat only: ASR is phonon-2-web (Parakeet); the value is ignored
 
@@ -169,7 +169,7 @@ function parse() {
     capture: 'auto', timeout: 45, avatar_corner: 'bottom-right', avatar_size: 26.0,
     image_limit: 0, slide_seconds: 6.0, image_sources: 'all', kenburns: true,
     script_seconds: 60, scraper: 'obscura', llm_model: 'gemini-3.5-flash-lite',
-    voice: 'Easton', tts_model: 'hf://gradium/phonon-31m-en', tts_quant: 'q4k', tts_lang: 'en',
+    voice: 'M2', tts_model: 'hf://n4ze3m/tiny-voca', tts_quant: 'js', tts_lang: 'en',
     whisper_model: 'tiny', captions: true, cap_style: 'pop', cap_color: '#FFD700',
     cap_font: 'Anton', cap_size: 100, cap_position: 'low', cap_words: 4, cap_chars: 0,
     no_caps: false, separate: false, keep_files: false,

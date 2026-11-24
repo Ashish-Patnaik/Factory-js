@@ -73,10 +73,14 @@ async function main() {
 
   // TTS
   try {
-    const pkg = path.join(ROOT, 'node_modules', 'phonon-tts', 'wasm', 'phonon_tts_bg.wasm');
-    if (fs.existsSync(pkg)) ok('phonon-tts WASM engine present (model downloads once to .cache/tts)');
-    else bad('phonon-tts not installed - run: npm install');
-  } catch { bad('phonon-tts not installed'); }
+    const say = path.join(ROOT, '.cache', 'tts', 'tiny-voca', 'js', 'say.mjs');
+    const gguf = path.join(ROOT, '.cache', 'tts', 'tiny-voca', 'tiny-voca-js.gguf');
+    if (fs.existsSync(say) && fs.existsSync(gguf)) {
+      ok('tiny-voca TTS ready (.cache/tts/tiny-voca, voice M2)');
+    } else {
+      warn('tiny-voca TTS not cached yet - run: npm run setup:tts (or auto-downloads on first render)');
+    }
+  } catch { warn('tiny-voca TTS check failed'); }
 
   // ASR
   const asr = asrAvailable();
