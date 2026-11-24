@@ -47,14 +47,15 @@ jobs:
           path: |
             .cache
             ~/.cache/ms-playwright
-          key: ${{ runner.os }}-24.04-gta-factory-${{ hashFiles('package-lock.json') }}
+          key: ${{ runner.os }}-24.04-gta-tinyvoca-${{ hashFiles('package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-24.04-gta-factory-
+            ${{ runner.os }}-24.04-gta-tinyvoca-
 
       # 5. Install Node dependencies & verify ASR engine
       - name: Install Node dependencies & setup ASR
         run: |
           npm ci
+          node scripts/setup-tts.mjs
           node scripts/setup-asr.mjs
 
       # 6. Install FFmpeg, fonts, and Playwright Chromium (with retries)
