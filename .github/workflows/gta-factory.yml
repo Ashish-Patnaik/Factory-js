@@ -1,16 +1,11 @@
-
 name: GTA 6 AI Shorts Factory
 
 on:
   schedule:
-    - cron: '30 1 * * *'  # 7:00 AM
-    - cron: '30 2 * * *'  # 8:00 AM
-
-    # 3:07 PM IST
-    - cron: '37 9 * * *'
-    # 9:07 PM IST
-    - cron: '37 15 * * *'
-
+    - cron: '30 1 * * *'   # 7:00 AM IST
+    - cron: '30 2 * * *'   # 8:00 AM IST
+    - cron: '37 9 * * *'   # 3:07 PM IST
+    - cron: '37 15 * * *'  # 9:07 PM IST
   workflow_dispatch:
 
 permissions:
@@ -22,7 +17,7 @@ concurrency:
 
 jobs:
   produce-and-publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 90
 
     steps:
@@ -36,100 +31,180 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 22
-          cache: npm
+          node-version: '22'
+          cache: 'npm'
 
-      # 3. Setup Deno for YouTube extraction
+      # 3. Setup Deno for YouTube JS challenge solving
       - name: Setup Deno
         uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
 
-      # 4. Cache browser and application files
+      # 4. Cache models and Playwright Chromium
       - name: Cache application files
         uses: actions/cache@v4
         with:
           path: |
             .cache
             ~/.cache/ms-playwright
-          key: ${{ runner.os }}-gta-factory-${{ hashFiles('package-lock.json') }}
+          key: ${{ runner.os }}-24.04-gta-factory-${{ hashFiles('package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-gta-factory-
+            ${{ runner.os }}-24.04-gta-factory-
 
-      # 5. Install FFmpeg and system dependencies
-      - name: Install system dependencies
+      # 5. Install Node dependencies & verify ASR engine
+      - name: Install Node dependencies & setup ASR
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
+          npm ci
+          node scripts/setup-asr.mjs
+
+      # 6. Install FFmpeg, fonts, and Playwright Chromium (with retries)
+      - name: Install system dependencies & Playwright Chromium
+        run: |
+          APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true"
+          retry() {
+            local n=1
+            until "$@"; do
+              if [ $n -ge 4 ]; then return 1; fi
+              echo "Command failed (attempt $n/4); retrying in $((n * 5))s..."
+              sleep $((n * 5))
+              n=$((n + 1))
+            done
+          }
+
+          retry sudo apt-get $APT_OPTS update || true
+          retry sudo apt-get $APT_OPTS install -y --no-install-recommends --fix-missing \
             ffmpeg \
             fonts-liberation \
             fonts-noto-color-emoji \
-            fonts-dejavu-core
+            fonts-dejavu-core || true
 
-      # 6. Install yt-dlp
-      - name: Install yt-dlp
+          if ! find ~/.cache/ms-playwright -maxdepth 2 -name 'chromium-*' 2>/dev/null | grep -q .; then
+            retry npx playwright install chromium
+          fi
+          retry sudo npx playwright install-deps chromium
+
+      # 7. Install latest yt-dlp + BotGuard PO Token plugin
+      - name: Install yt-dlp & PO Token plugin
         run: |
-          python3 -m pip install --user --break-system-packages --upgrade yt-dlp
+          python3 -m pip install --retries 5 --user --break-system-packages --upgrade \
+            yt-dlp \
+            bgutil-ytdlp-pot-provider
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # 7. Verify dependencies
+      # 8. Start local BotGuard PO Token server (bypasses datacenter bot checks)
+      - name: Start YouTube PO Token provider (bgutil)
+        run: |
+          docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider || true
+          for i in $(seq 1 15); do
+            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then
+              echo "bgutil PO token server is ready on :4416"
+              break
+            fi
+            sleep 1
+          done
+
+      # 9. Auto-configure yt-dlp (probes PO-token cookieless first, falls back to YT_COOKIES_B64)
+      - name: Configure resilient yt-dlp auth & client fallback
+        env:
+          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+        run: |
+          mkdir -p "$HOME/.config/yt-dlp"
+          CONF="$HOME/.config/yt-dlp/config"
+          TEST_URL="https://www.youtube.com/watch?v=jNQXAC9IVRw"
+
+          if [ -n "$YT_COOKIES_B64" ]; then
+            echo "$YT_COOKIES_B64" | base64 --decode > /tmp/yt_cookies.txt
+            chmod 600 /tmp/yt_cookies.txt
+          fi
+
+          write_base_conf() {
+            cat > "$CONF" <<'EOF'
+          --js-runtimes deno
+          --remote-components ejs:github
+          --retries 5
+          --fragment-retries 5
+          --sleep-requests 1
+          EOF
+          }
+
+          # Tier 1: Cookieless PO-token + mobile/TV/VR clients (keeps cookies untouched when possible)
+          write_base_conf
+          echo '--extractor-args "youtube:player_client=mweb,tv_simply,android_vr"' >> "$CONF"
+          if yt-dlp --skip-download --no-warnings -f "b/bv*" --get-url "$TEST_URL" >/dev/null 2>&1; then
+            echo "[yt-dlp] Tier 1 active: cookieless PO-token + mweb/tv_simply/android_vr"
+            exit 0
+          fi
+
+          # Tier 2: Authenticated cookies + PO-token (handles strict Azure IP blocks)
+          if [ -s /tmp/yt_cookies.txt ]; then
+            write_base_conf
+            echo '--cookies /tmp/yt_cookies.txt' >> "$CONF"
+            echo '--extractor-args "youtube:player_client=tv,web,mweb"' >> "$CONF"
+            if yt-dlp --skip-download --no-warnings -f "b/bv*" --get-url "$TEST_URL" >/dev/null 2>&1; then
+              echo "[yt-dlp] Tier 2 active: YT_COOKIES_B64 + PO-token"
+              exit 0
+            fi
+            echo "[yt-dlp] warning: YT_COOKIES_B64 probe failed (cookies may have expired); trying android_vr..."
+          else
+            echo "[yt-dlp] note: YT_COOKIES_B64 secret not set; trying standalone android_vr..."
+          fi
+
+          # Tier 3: Last-resort standalone android_vr client
+          write_base_conf
+          echo '--extractor-args "youtube:player_client=android_vr"' >> "$CONF"
+
+      # 10. Verify dependencies
       - name: Verify GTA dependencies
         run: |
           node --version
           yt-dlp --version
-          ffmpeg -version
-          ffprobe -version
+          ffmpeg -version | head -n 1 || true
           deno --version
-
-      # 8. Install Node dependencies
-      - name: Install Node dependencies
-        run: npm ci
-
-      # 9. Setup ASR
-      - name: Setup ASR
-        run: node scripts/setup-asr.mjs
-
-      # 10. Install Playwright Chromium
-      - name: Install Playwright Chromium
-        run: npx playwright install --with-deps chromium
 
       # 11. Restore YouTube OAuth credentials
       - name: Restore YouTube credentials
         env:
           YT_CLIENT_SECRETS_B64: ${{ secrets.YT_CLIENT_SECRETS_B64 }}
-          YT_TOKEN_PICKLE_B64: ${{ secrets.YT_TOKEN_PICKLE_B64 }}
+          YT_TOKEN_JSON_B64: ${{ secrets.YT_TOKEN_JSON_B64 }}
         run: |
           echo "$YT_CLIENT_SECRETS_B64" | base64 --decode > client_secrets.json
-          echo "$YT_TOKEN_PICKLE_B64" | base64 --decode > token.pickle
+          echo "$YT_TOKEN_JSON_B64" | base64 --decode > token.json
 
       # 12. Generate and publish GTA Shorts
       - name: Generate and publish GTA Shorts
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: 'baidu/ernie-5.5-flash-preview:free'
           IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
           IG_USER_ID: ${{ secrets.IG_USER_ID }}
-        run: |
-          node main.js --gta --random --publish all
+          REEL_MAX_SECONDS: '89'
+          TZ: Asia/Kolkata
+        run: node main.js --gta --random --publish all
 
-      # 13. Cleanup credentials
-      - name: Cleanup OAuth credentials
+      # 13. Cleanup credentials & cookies
+      - name: Cleanup OAuth credentials & cookies
         if: always()
         run: |
-          shred -u client_secrets.json token.pickle 2>/dev/null || true
+          rm -f client_secrets.json token.json /tmp/yt_cookies.txt
+          docker rm -f bgutil-provider >/dev/null 2>&1 || true
 
       # 14. Commit generation history
       - name: Commit history
         if: always()
         run: |
           git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-
-          git add output/history.json
-
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update GTA content history"
-            git pull --rebase origin main
-            git push origin HEAD:main
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p output
+          if [ -f output/history.json ]; then
+            git add -f output/history.json
+            if git diff --cached --quiet; then
+              echo "No history changes to commit."
+            else
+              git commit -m "chore: update GTA content history [skip ci]"
+              git pull --rebase origin "${{ github.ref_name }}"
+              git push
+            fi
           else
-            echo "No history changes to commit."
+            echo "No output/history.json produced this run."
           fi
