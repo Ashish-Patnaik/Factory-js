@@ -719,7 +719,7 @@ ${listing}
 
 Pick the ONE post that will make the best Instagram image post today:
 1. Self-contained text whose screenshot ALONE tells a story, hot take, confession, life lesson or wild fact.
-2. Strong hook in the title; the body keeps delivering (real stories, opinions, career/dev insight for a tech audience).
+2. Strong hook in the title; the body keeps delivering (viral opinions, hot takes, practical tips/tricks, real stories, or sharp tech/gaming insights tailored to this subreddit).
 3. Avoid: pure link/image/video posts with no text, polls, mod announcements, inside jokes that need thread context, anything NSFW.
 Return ONLY valid JSON: {"pick": <index>, "reason": "one sentence"}`;
   const data = extractJson(await llm(cfg, prompt));
