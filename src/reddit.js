@@ -339,23 +339,43 @@ const CHALLENGE_WAIT_MS = () => Number(process.env.REDDIT_CHALLENGE_WAIT_MS ?? 2
 
 async function gotoReddit(page, url, { attempts = 3 } = {}) {
   let lastErr = null;
+  const targetPath = (() => { try { return new URL(url).pathname.replace(/\/+$/, ''); } catch { return ''; } })();
+
   for (let i = 0; i < attempts; i++) {
-    // The last try only waits for 'commit' - a hung font/ad can no longer kill the run.
     const waitUntil = i === attempts - 1 ? 'commit' : 'domcontentloaded';
     try {
+      // On attempt 2+, if the previous try hit Obscura's 30s Page.navigate deadline,
+      // navigate via window.location.assign to bypass CDP Page.navigate completely.
+      if (i > 0 && lastErr && /30000ms deadline/i.test(String(lastErr?.message ?? lastErr))) {
+        console.log('[reddit] bypassing Obscura 30s Page.navigate limit via client-side navigation...');
+        await page.evaluate((u) => { window.location.assign(u); }, url).catch(() => {});
+        const deadline = Date.now() + 25000;
+        while (Date.now() < deadline) {
+          const cur = page.url();
+          const hasPost = await page.evaluate((sel) => !!document.querySelector(sel), POST_SELECTOR).catch(() => false);
+          if (hasPost || (targetPath && cur.includes(targetPath))) return null;
+          await page.waitForTimeout(800);
+        }
+        throw new Error('client-side navigation timed out waiting for Reddit content');
+      }
       return await page.goto(url, { waitUntil, timeout: NAV_TIMEOUT });
     } catch (e) {
       const msg = String(e?.message ?? e);
-      // "Navigation to X is interrupted by another navigation to Y": Reddit's JS
-      // challenge redirect took over. That is the wall WORKING - let it land
-      // instead of restarting it with a fresh goto.
+      // If Obscura timed out Page.navigate AFTER the page already rendered, keep going.
+      if (/30000ms deadline/i.test(msg)) {
+        const hasPost = await page.evaluate((sel) => !!document.querySelector(sel), POST_SELECTOR).catch(() => false);
+        if (hasPost) {
+          console.log('[reddit] page timed out on subresources, but post DOM is already loaded; continuing');
+          return null;
+        }
+      }
       const interrupted = /interrupted by another navigation|ERR_ABORTED/i.test(msg);
       const target = (msg.match(/another navigation to\s+"?([^"\s,]+)"?/i) ?? [])[1] ?? '';
       if (interrupted && /reddit\.com/i.test(target)) {
         console.log('[reddit] the js_challenge redirect took over the navigation; letting it land');
         await page.waitForLoadState('domcontentloaded', { timeout: 20000 }).catch(() => {});
         await page.waitForTimeout(1500);
-        if (/reddit\.com/i.test(page.url())) return null; // callers treat null as "unknown status"
+        if (/reddit\.com/i.test(page.url())) return null;
       }
       lastErr = e;
       if (i < attempts - 1) {
@@ -897,6 +917,46 @@ async function capturePost(page, postUrl, style, outPath) {
   return { path: outPath, width: box.width, height: box.height, card };
 }
 
+// Screenshot fallback: if Obscura can't open a heavy post page, hand the screenshot
+// step to bundled Chromium with the same session cookies and ad/tracker blocking.
+async function capturePostWithFallback(page, cfg, postUrl, style, outPath) {
+  try {
+    return await capturePost(page, postUrl, style, outPath);
+  } catch (obscuraErr) {
+    console.log(`[reddit] primary browser capture failed (${String(obscuraErr?.message ?? obscuraErr).split('\n')[0]}); retrying screenshot with Chromium...`);
+    const browser = await chromium.launch({
+      headless: true,
+      args: ['--disable-blink-features=AutomationControlled'],
+    });
+    try {
+      const context = await browser.newContext({
+        viewport: { width: 1280, height: 1000 },
+        userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+        locale: 'en-US',
+      });
+      await context.addInitScript('Object.defineProperty(navigator, "webdriver", { get: () => undefined });');
+
+      // Copy live cookies from Obscura (including any solved js_challenge cookies) + configured session cookie
+      const liveCookies = await page.context().cookies('https://www.reddit.com').catch(() => []);
+      const envCookies = parseRedditCookies(cfg.reddit_cookie ?? process.env.REDDIT_SESSION_COOKIE ?? null);
+      const merged = [...liveCookies, ...envCookies];
+      if (merged.length) await context.addCookies(merged).catch(() => {});
+
+      const fallbackPage = await context.newPage();
+      fallbackPage.setDefaultTimeout(Math.max(cfg.timeout, 45) * 1000);
+      // Drop ad/analytics/telemetry beacons so heavy threads settle quickly
+      await fallbackPage.route(
+        /(doubleclick|googlesyndication|googletagmanager|amazon-adsystem|alb\.reddit\.com|events\.redditmedia\.com)/i,
+        (route) => route.abort(),
+      ).catch(() => {});
+
+      return await capturePost(fallbackPage, postUrl, style, outPath);
+    } finally {
+      await browser.close().catch(() => {});
+    }
+  }
+}
+
 // Restyles the LIVE post page for the scroll video - called from main.js run() via the
 // cfg.reddit_style hook, right before the scroll/recording pass.
 export async function styleRedditPage(page, cfg) {
@@ -1044,12 +1104,15 @@ export async function runRedditFlow(cfg, g, work, hooks = {}) {
     }
   }
 
-  // 2) One browser session does everything: hot listing (with multi-subreddit failover), post details, screenshot.
+  // 2) One browser session: hot listing (multi-subreddit failover) -> post details -> screenshot (Chromium + multi-post failover)
   const persona = await loadPersona(cfg.persona_file);
   if (!persona) console.log('[reddit] note: persona.md missing/unreadable - the AI will use a neutral voice');
   let captured = null;
   await withSession(cfg, async (page) => {
-    if (!g.post_url) {
+    let postQueue = [];
+    if (g.post_url) {
+      postQueue = [post];
+    } else {
       let lastSubErr = null;
       for (const sub of subredditQueue) {
         try {
@@ -1061,30 +1124,44 @@ export async function runRedditFlow(cfg, g, work, hooks = {}) {
             continue;
           }
           console.log(`[reddit] ${fresh.length} fresh hot post(s) (${hot.length - fresh.length} already posted)`);
-          post = await pickWithFallback(cfg, persona, fresh, sub);
+          const topPick = await pickWithFallback(cfg, persona, fresh, sub);
+          const backups = fresh.filter((p) => p.permalink !== topPick.permalink).slice(0, 2);
+          postQueue = [topPick, ...backups];
           break;
         } catch (e) {
           lastSubErr = e;
           console.log(`[reddit] ${sub} failed (${String(e?.message ?? e).split('\n')[0]}), trying next subreddit...`);
         }
       }
-      if (!post) {
+      if (!postQueue.length) {
         die(lastSubErr
           ? `all subreddits failed (last error: ${String(lastSubErr?.message ?? lastSubErr).split('\n')[0]})`
           : 'every hot post across sources_reddit.md is already in output/history.json');
       }
     }
-    const detail = await fetchPostDetail(page, post.permalink);
-    post = {
-      ...post,
-      title: detail.title || post.title,
-      selftext: detail.selftext || post.selftext,
-      comments: detail.comments,
-      subreddit: post.subreddit || subredditFromPermalink(post.permalink),
-    };
-    console.log(`[reddit] post: "${(post.title || post.permalink).slice(0, 90)}" (${post.subreddit}, ${post.score} upvotes, ${post.numComments} comments)`);
-    const slug = postSlug(post.permalink, post.title);
-    captured = await capturePost(page, post.permalink, style, path.join(REDDIT_OUT_DIR, `${slug}-${style}.png`));
+
+    let lastCapErr = null;
+    for (const cand of postQueue) {
+      try {
+        const detail = await fetchPostDetail(page, cand.permalink);
+        const enriched = {
+          ...cand,
+          title: detail.title || cand.title,
+          selftext: detail.selftext || cand.selftext,
+          comments: detail.comments,
+          subreddit: cand.subreddit || subredditFromPermalink(cand.permalink),
+        };
+        console.log(`[reddit] post: "${(enriched.title || enriched.permalink).slice(0, 90)}" (${enriched.subreddit}, ${enriched.score} upvotes, ${enriched.numComments} comments)`);
+        const candSlug = postSlug(enriched.permalink, enriched.title);
+        captured = await capturePostWithFallback(page, cfg, enriched.permalink, style, path.join(REDDIT_OUT_DIR, `${candSlug}-${style}.png`));
+        post = enriched;
+        break;
+      } catch (e) {
+        lastCapErr = e;
+        console.log(`[reddit] capture failed for ${cand.permalink} (${String(e?.message ?? e).split('\n')[0]}), trying next candidate post...`);
+      }
+    }
+    if (!captured) throw lastCapErr ?? new Error('could not capture any candidate Reddit post');
   });
 
   const slug = postSlug(post.permalink, post.title);
