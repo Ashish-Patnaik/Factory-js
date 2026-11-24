@@ -15,6 +15,8 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
+import os from 'node:os';
+import sharp from 'sharp';
 import { probeMedia } from './utils.js';
 
 // --- YouTube config ---
@@ -558,32 +560,96 @@ export async function uploadInstagramReel(videoPath, title, description, hashtag
   console.log(`[instagram] published! Media ID: ${pub.id}`);
   return pub.id;
 }
-
 // ---------------------------------------------------------------------------
 // Instagram FEED image posts (--reddit)
-//
-// The Graph API can only publish a photo from a PUBLIC image_url - it has no local-file
-// photo upload (unlike the reel rupload protocol above). So the screenshot is auto-hosted
-// on a chain of keyless hosts. Two hard-earned lessons from the field:
-//   * A host can ACCEPT the upload but then serve an HTML page instead of the file
-//     (tmpfiles' /dl/ link behind a challenge, catbox outages...) -> Meta answers error
-//     36001 "The image format is not supported". So EVERY hosted URL is downloaded back
-//     and checked for real image magic bytes BEFORE it is handed to Meta.
-//   * A URL we can fetch fine may still be unreachable from Meta's datacenter IPs (some
-//     hosts block cloud/datacenter ranges). So when container creation itself fails with
-//     an image-fetch error, the file is RE-HOSTED on the next provider and retried with a
-//     fresh container - unused containers simply expire, nothing is published by accident.
-// Chain: catbox.moe (permanent) -> litterbox.catbox.moe (catbox's separate temp
-// infrastructure, 1h) -> tmpfiles.org (1h) -> 0x0.st (30+ days). Pass --image-url or set
-// IG_IMAGE_URL to host it yourself and skip the upload entirely.
 // ---------------------------------------------------------------------------
 const UPLOAD_TIMEOUT = 120000;
 
-async function hostOnCatbox(imagePath) {
+// Convert any screenshot into a clean sRGB JPEG that always satisfies Instagram's
+// feed photo rules (JPEG, <= 8 MB, 1080px wide, aspect ratio strictly inside 4:5..1.91:1).
+async function prepareInstagramJpeg(imagePath) {
+  const meta = await sharp(imagePath).metadata();
+  const w = meta.width || 1080;
+  const h = meta.height || 1080;
+  const ratio = w / h;
+  const tmpOut = path.join(os.tmpdir(), `ig_post_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`);
+
+  // If the screenshot is smaller than 900px wide OR outside Instagram's 4:5..1.91:1 ratio,
+  // mount it cleanly on a crisp 1080x1080 (square) or 1080x1350 (4:5 portrait) card.
+  if (w < 900 || ratio > 1.85 || ratio < 0.82) {
+    const outW = 1080;
+    const outH = ratio < 0.95 ? 1350 : 1080;
+    const padX = Math.round(outW * 0.06);
+    const padY = Math.round(outH * 0.06);
+
+    const cardBuf = await sharp(imagePath)
+      .flatten({ background: '#ffffff' })
+      .resize({
+        width: outW - padX * 2,
+        height: outH - padY * 2,
+        fit: 'inside',
+        withoutEnlargement: false,
+      })
+      .png()
+      .toBuffer();
+    const cm = await sharp(cardBuf).metadata();
+    const cw = cm.width, ch = cm.height;
+    const r = Math.max(18, Math.round(cw * 0.025));
+    const mask = Buffer.from(
+      `<svg width="${cw}" height="${ch}"><rect x="0" y="0" width="${cw}" height="${ch}" rx="${r}" ry="${r}"/></svg>`,
+    );
+    const rounded = await sharp(cardBuf).composite([{ input: mask, blend: 'dest-in' }]).png().toBuffer();
+
+    await sharp({
+      create: { width: outW, height: outH, channels: 3, background: { r: 18, g: 18, b: 22 } },
+    })
+      .composite([{ input: rounded, left: Math.round((outW - cw) / 2), top: Math.round((outH - ch) / 2) }])
+      .jpeg({ quality: 92, mozjpeg: true })
+      .toFile(tmpOut);
+  } else {
+    await sharp(imagePath)
+      .flatten({ background: '#ffffff' })
+      .resize({ width: Math.min(w, 1440), withoutEnlargement: true })
+      .jpeg({ quality: 92, mozjpeg: true })
+      .toFile(tmpOut);
+  }
+  return tmpOut;
+}
+
+function imageBlob(imagePath) {
   const buf = fs.readFileSync(imagePath);
+  const isJpg = /\.jpe?g$/i.test(imagePath);
+  return {
+    blob: new Blob([buf], { type: isJpg ? 'image/jpeg' : 'image/png' }),
+    name: path.basename(imagePath),
+    buf,
+  };
+}
+
+// Optional free CDN host (100% Meta-friendly). Get a free key at https://api.imgbb.com/
+async function hostOnImgbb(imagePath) {
+  const key = (process.env.IMGBB_API_KEY ?? '').trim();
+  if (!key) throw new Error('IMGBB_API_KEY not set');
+  const { buf, name } = imageBlob(imagePath);
+  const fd = new FormData();
+  fd.set('image', buf.toString('base64'));
+  fd.set('name', name.replace(/\.[^.]+$/, ''));
+  const res = await fetch(`https://api.imgbb.com/1/upload?expiration=3600&key=${encodeURIComponent(key)}`, {
+    method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+  });
+  const j = await res.json().catch(() => null);
+  const url = String(j?.data?.image?.url ?? j?.data?.url ?? '');
+  if (!res.ok || !/^https?:\/\//.test(url)) {
+    throw new Error(`imgbb upload failed (HTTP ${res.status}): ${JSON.stringify(j?.error ?? '').slice(0, 120)}`);
+  }
+  return url;
+}
+
+async function hostOnCatbox(imagePath) {
+  const { blob, name } = imageBlob(imagePath);
   const fd = new FormData();
   fd.set('reqtype', 'fileupload');
-  fd.set('fileToUpload', new Blob([buf], { type: 'image/png' }), path.basename(imagePath));
+  fd.set('fileToUpload', blob, name);
   const res = await fetch('https://catbox.moe/user/api.php', {
     method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
   });
@@ -594,15 +660,12 @@ async function hostOnCatbox(imagePath) {
   return url;
 }
 
-// litterbox is catbox's temporary-file sibling on DIFFERENT infrastructure - it often
-// still works when catbox.moe itself is unreachable (the "fetch failed" outage), and its
-// 1h expiry is irrelevant because the publish happens seconds later.
 async function hostOnLitterbox(imagePath) {
-  const buf = fs.readFileSync(imagePath);
+  const { blob, name } = imageBlob(imagePath);
   const fd = new FormData();
   fd.set('reqtype', 'fileupload');
   fd.set('time', '1h');
-  fd.set('fileToUpload', new Blob([buf], { type: 'image/png' }), path.basename(imagePath));
+  fd.set('fileToUpload', blob, name);
   const res = await fetch('https://litterbox.catbox.moe/resources/internals/api.php', {
     method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
   });
@@ -613,10 +676,41 @@ async function hostOnLitterbox(imagePath) {
   return url;
 }
 
-async function hostOnTmpfiles(imagePath) {
-  const buf = fs.readFileSync(imagePath);
+async function hostOnUguu(imagePath) {
+  const { blob, name } = imageBlob(imagePath);
   const fd = new FormData();
-  fd.set('file', new Blob([buf], { type: 'image/png' }), path.basename(imagePath));
+  fd.set('files[]', blob, name);
+  const res = await fetch('https://uguu.se/upload?output=text', {
+    method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+  });
+  const url = (await res.text()).trim().split(/\s+/)[0] ?? '';
+  if (!res.ok || !/^https?:\/\//.test(url)) {
+    throw new Error(`uguu.se upload failed (HTTP ${res.status}): ${url.slice(0, 120)}`);
+  }
+  return url;
+}
+
+async function hostOn0x0(imagePath) {
+  const { blob, name } = imageBlob(imagePath);
+  const fd = new FormData();
+  fd.set('file', blob, name);
+  const res = await fetch('https://0x0.st', {
+    method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36',
+    },
+  });
+  const url = (await res.text()).trim();
+  if (!res.ok || !/^https?:\/\//.test(url)) {
+    throw new Error(`0x0.st upload failed (HTTP ${res.status}): ${url.slice(0, 120)}`);
+  }
+  return url;
+}
+
+async function hostOnTmpfiles(imagePath) {
+  const { blob, name } = imageBlob(imagePath);
+  const fd = new FormData();
+  fd.set('file', blob, name);
   const res = await fetch('https://tmpfiles.org/api/v1/upload', {
     method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
   });
@@ -628,41 +722,23 @@ async function hostOnTmpfiles(imagePath) {
   return url;
 }
 
-// 0x0.st answers with the bare file URL as plain text and serves the raw bytes back
-// (content-type image/*) - needs a browser-ish User-Agent or it refuses the request.
-async function hostOn0x0(imagePath) {
-  const buf = fs.readFileSync(imagePath);
-  const fd = new FormData();
-  fd.set('file', new Blob([buf], { type: 'image/png' }), path.basename(imagePath));
-  const res = await fetch('https://0x0.st', {
-    method: 'POST', body: fd, signal: AbortSignal.timeout(UPLOAD_TIMEOUT),
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
-    },
-  });
-  const url = (await res.text()).trim();
-  if (!res.ok || !/^https?:\/\//.test(url)) {
-    throw new Error(`0x0.st upload failed (HTTP ${res.status}): ${url.slice(0, 120)}`);
-  }
-  return url;
+function getImageHosters() {
+  const list = [];
+  if ((process.env.IMGBB_API_KEY ?? '').trim()) list.push(['imgbb.com', hostOnImgbb]);
+  list.push(
+    ['catbox.moe', hostOnCatbox],
+    ['litterbox.catbox.moe', hostOnLitterbox],
+    ['uguu.se', hostOnUguu],
+    ['0x0.st', hostOn0x0],
+    ['tmpfiles.org', hostOnTmpfiles],
+  );
+  return list;
 }
 
-const IMAGE_HOSTERS = [
-  ['catbox.moe', hostOnCatbox],
-  ['litterbox.catbox.moe', hostOnLitterbox],
-  ['tmpfiles.org', hostOnTmpfiles],
-  ['0x0.st', hostOn0x0],
-];
-
-// Download the just-hosted URL back and PROVE it returns image bytes, not an HTML error
-// page or a bot-challenge. This is the guard against the tmpfiles-style failure that made
-// Meta answer 36001 "The image format is not supported ... the URL returned an error page
-// instead of an image". Exported for unit tests.
 export async function verifyHostedImage(url) {
   const res = await fetch(url, {
     headers: {
-      // browser-like UA: some hosts serve challenge pages to bare/node user agents
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36',
+      'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
     },
     signal: AbortSignal.timeout(30000),
     redirect: 'follow',
@@ -675,18 +751,15 @@ export async function verifyHostedImage(url) {
   const isGif = buf.length >= 6 && buf.toString('latin1', 0, 3) === 'GIF';
   const isWebP = buf.length >= 12 && buf.toString('latin1', 8, 12) === 'WEBP';
   if (!isPng && !isJpeg && !isGif && !isWebP) {
-    throw new Error(`the URL serves ${buf.length} bytes of ${ct || 'unknown type'} starting with ${buf.subarray(0, 4).toString('hex')} - not an image (the host is serving a page/challenge instead of the file)`);
+    throw new Error(`serves ${buf.length} bytes of ${ct || 'unknown type'} (HTML/challenge page instead of image)`);
   }
-  // Magic bytes win; some CDNs label images as octet-stream and Instagram still accepts them.
   if (ct && !ct.startsWith('image/') && !ct.includes('octet-stream')) {
-    throw new Error(`the URL serves content-type ${ct} - Instagram may reject it`);
+    throw new Error(`serves content-type ${ct} - Instagram may reject it`);
   }
   return { bytes: buf.length, contentType: ct };
 }
 
-// Upload to one provider after another (starting at startIndex, wrapping around), VERIFying
-// each URL until one hands back real image bytes. Exported for tests (hosters injectable).
-export async function hostImageAcrossProviders(imagePath, startIndex = 0, hosters = IMAGE_HOSTERS) {
+export async function hostImageAcrossProviders(imagePath, startIndex = 0, hosters = getImageHosters()) {
   const sizeMB = fs.statSync(imagePath).size / 1e6;
   if (sizeMB > 8) {
     throw new Error(`the image is ${sizeMB.toFixed(1)} MB - Instagram's photo limit is 8 MB`);
@@ -700,121 +773,122 @@ export async function hostImageAcrossProviders(imagePath, startIndex = 0, hoster
       const url = await host(imagePath);
       await verifyHostedImage(url);
       console.log(`[instagram] image hosted on ${name}: ${url}`);
-      return { url, index: i };
+      return { url, index: i, count: n };
     } catch (e) {
       hostErr = e;
       console.log(`[instagram] ${name} hosting failed (${String(e?.message ?? e).split('\n')[0]}); trying the next host`);
     }
   }
   throw new Error(`could not host the image anywhere (${hostErr?.message ?? 'unknown error'}). ` +
-    'Host the PNG anywhere public and pass --image-url <url> (or set IG_IMAGE_URL).');
+    'Set IMGBB_API_KEY (free at api.imgbb.com) or pass --image-url <url>.');
 }
 
-// Is this Graph failure of the "Meta could not fetch/read the image URL" kind? Those are
-// the ONLY container failures worth re-hosting for - auth/permission errors fail fast.
 function isImageFetchError(err) {
   const msg = String(err?.message ?? err);
-  return /36001|2207083|image format|could not be processed|not a valid image|image_url/i.test(msg);
+  return /36001|2207083|2207004|image format|could not be processed|not a valid image|image_url|media download/i.test(msg);
 }
 
 export async function uploadInstagramImage(imagePath, caption, imageUrl = null) {
-  // Publish a local image to the Instagram FEED (a regular photo post, not a reel).
   if (!fs.existsSync(imagePath)) throw new Error(`Image file not found: ${imagePath}`);
   if (!IG_ACCESS_TOKEN || IG_ACCESS_TOKEN === 'YOUR_ACCESS_TOKEN_HERE' ||
       !IG_USER_ID || IG_USER_ID === 'YOUR_IG_USER_ID_HERE') {
     throw new Error('Instagram credentials missing. Set IG_ACCESS_TOKEN and IG_USER_ID env vars.');
   }
 
-  // 1) Resolve a public URL for the photo (upload + verify, rotating providers).
   const userProvided = Boolean(imageUrl ?? process.env.IG_IMAGE_URL);
   let publicUrl = imageUrl ?? process.env.IG_IMAGE_URL ?? null;
   let hostIndex = 0;
-  if (!publicUrl) {
-    const hosted = await hostImageAcrossProviders(imagePath);
-    publicUrl = hosted.url;
-    hostIndex = hosted.index;
-  } else {
-    console.log(`[instagram] using the provided image URL: ${publicUrl}`);
-    // Best-effort check for hand-supplied URLs: warn but respect the user's choice -
-    // our fetch being blocked does not prove Meta's is.
-    try { await verifyHostedImage(publicUrl); }
-    catch (e) {
-      console.log(`[instagram] WARNING: the provided image URL did not verify as an image (${String(e?.message ?? e).split('\n')[0]}); Meta will likely reject it`);
-    }
-  }
+  let hostCount = getImageHosters().length;
+  let uploadPath = imagePath;
+  let tempJpeg = null;
 
-  // 2) Create the photo container. If META itself cannot fetch the image (its fetchers
-  //    come from datacenter IPs a host may block - invisible to our own verification),
-  //    re-host on the NEXT provider and retry with a fresh container instead of dying.
-  const MEDIA_ATTEMPTS = 3;
-  let data = null;
-  let lastErr = null;
-  for (let attempt = 1; attempt <= MEDIA_ATTEMPTS && !data; attempt++) {
-    try {
-      const created = await jsonFetch(`${BASE_URL}/${IG_USER_ID}/media`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({
-          image_url: publicUrl,
-          caption: String(caption ?? '').slice(0, 2200),
-          access_token: IG_ACCESS_TOKEN,
-        }),
-      });
-      data = igCheck(created);
-    } catch (e) {
-      lastErr = e;
-      if (userProvided || !isImageFetchError(e) || attempt === MEDIA_ATTEMPTS) throw e;
-      console.log(`[instagram] Meta could not fetch the image (${String(e?.message ?? e).split('\n')[0].slice(0, 160)}); re-hosting on the next provider and retrying...`);
-      const next = await hostImageAcrossProviders(imagePath, hostIndex + 1);
-      publicUrl = next.url;
-      hostIndex = next.index;
-    }
-  }
-  if (!data) throw lastErr ?? new Error('Instagram media creation failed');
-  const containerId = data.id;
-  console.log(`[instagram] photo container created: ${containerId}`);
-
-  // 3) Photos usually process instantly, but poll briefly before publishing.
-  let waited = 0;
-  let ok = false;
-  while (waited < 60) {
-    let stData = null;
-    try {
-      stData = (await jsonFetch(`${BASE_URL}/${containerId}?fields=status_code&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`)).data;
-    } catch { /* transient Graph glitches: just poll again */ }
-    const status = stData?.status_code;
-    if (status) console.log(`[instagram] container status: ${status}`);
-    if (status === 'FINISHED') { ok = true; break; }
-    if (status === 'ERROR' || status === 'EXPIRED') {
-      throw new Error(`Instagram rejected the photo (container ${containerId} status ${status}) - ` +
-        'check the image dimensions (320-1440px, aspect ratio 4:5 to 1.91:1) and the public image URL');
-    }
-    await new Promise((r) => setTimeout(r, 3000));
-    waited += 3;
-  }
-  if (!ok) console.log('[instagram] status poll timed out; attempting media_publish anyway');
-
-  // 4) Publish (media_publish can transiently claim the container is not ready - retry).
-  let pub = null;
-  let pubErr = null;
-  for (let pubTry = 1; pubTry <= 3 && !pub; pubTry++) {
-    try {
-      const res = await jsonFetch(`${BASE_URL}/${IG_USER_ID}/media_publish`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({ creation_id: containerId, access_token: IG_ACCESS_TOKEN }),
-      });
-      if (res.status === 200 && res.data?.id) pub = res.data;
-      else throw new Error(`Instagram API error (${res.status}): ${JSON.stringify(res.data ?? res.text?.slice(0, 200))}`);
-    } catch (e) {
-      pubErr = e;
-      if (pubTry < 3) {
-        console.log(`[instagram] media_publish try ${pubTry}/3 hit a transient failure, retrying in 5s...`);
-        await new Promise((r) => setTimeout(r, 5000));
+  try {
+    if (!publicUrl) {
+      tempJpeg = await prepareInstagramJpeg(imagePath);
+      uploadPath = tempJpeg;
+      const hosted = await hostImageAcrossProviders(uploadPath);
+      publicUrl = hosted.url;
+      hostIndex = hosted.index;
+      hostCount = hosted.count;
+    } else {
+      console.log(`[instagram] using the provided image URL: ${publicUrl}`);
+      try { await verifyHostedImage(publicUrl); }
+      catch (e) {
+        console.log(`[instagram] WARNING: the provided image URL did not verify (${String(e?.message ?? e).split('\n')[0]})`);
       }
     }
+
+    const MEDIA_ATTEMPTS = userProvided ? 1 : Math.min(hostCount, 5);
+    let data = null;
+    let lastErr = null;
+    for (let attempt = 1; attempt <= MEDIA_ATTEMPTS && !data; attempt++) {
+      try {
+        const created = await jsonFetch(`${BASE_URL}/${IG_USER_ID}/media`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({
+            image_url: publicUrl,
+            caption: String(caption ?? '').slice(0, 2200),
+            access_token: IG_ACCESS_TOKEN,
+          }),
+        });
+        data = igCheck(created);
+      } catch (e) {
+        lastErr = e;
+        if (userProvided || !isImageFetchError(e) || attempt === MEDIA_ATTEMPTS) throw e;
+        console.log(`[instagram] Meta rejected host (${String(e?.message ?? e).split('\n')[0].slice(0, 140)}); re-hosting on next provider...`);
+        const next = await hostImageAcrossProviders(uploadPath, hostIndex + 1);
+        publicUrl = next.url;
+        hostIndex = next.index;
+      }
+    }
+    if (!data) throw lastErr ?? new Error('Instagram media creation failed');
+    const containerId = data.id;
+    console.log(`[instagram] photo container created: ${containerId}`);
+
+    let waited = 0;
+    let ok = false;
+    while (waited < 60) {
+      let stData = null;
+      try {
+        stData = (await jsonFetch(`${BASE_URL}/${containerId}?fields=status_code&access_token=${encodeURIComponent(IG_ACCESS_TOKEN)}`)).data;
+      } catch { /* transient Graph glitches */ }
+      const status = stData?.status_code;
+      if (status) console.log(`[instagram] container status: ${status}`);
+      if (status === 'FINISHED') { ok = true; break; }
+      if (status === 'ERROR' || status === 'EXPIRED') {
+        throw new Error(`Instagram rejected the photo (container ${containerId} status ${status})`);
+      }
+      await new Promise((r) => setTimeout(r, 3000));
+      waited += 3;
+    }
+    if (!ok) console.log('[instagram] status poll timed out; attempting media_publish anyway');
+
+    let pub = null;
+    let pubErr = null;
+    for (let pubTry = 1; pubTry <= 3 && !pub; pubTry++) {
+      try {
+        const res = await jsonFetch(`${BASE_URL}/${IG_USER_ID}/media_publish`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({ creation_id: containerId, access_token: IG_ACCESS_TOKEN }),
+        });
+        if (res.status === 200 && res.data?.id) pub = res.data;
+        else throw new Error(`Instagram API error (${res.status}): ${JSON.stringify(res.data ?? res.text?.slice(0, 200))}`);
+      } catch (e) {
+        pubErr = e;
+        if (pubTry < 3) {
+          console.log(`[instagram] media_publish try ${pubTry}/3 hit a transient failure, retrying in 5s...`);
+          await new Promise((r) => setTimeout(r, 5000));
+        }
+      }
+    }
+    if (!pub) throw pubErr ?? new Error('Instagram media_publish failed');
+    console.log(`[instagram] photo published to the feed! Media ID: ${pub.id}`);
+    return pub.id;
+  } finally {
+    if (tempJpeg && fs.existsSync(tempJpeg)) {
+      try { fs.rmSync(tempJpeg, { force: true }); } catch { /* ignore */ }
+    }
   }
-  if (!pub) throw pubErr ?? new Error('Instagram media_publish failed');
-  console.log(`[instagram] photo published to the feed! Media ID: ${pub.id}`);
-  return pub.id;
 }

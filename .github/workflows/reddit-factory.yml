@@ -1,0 +1,138 @@
+name: Reddit Viral Posts to Instagram
+
+# 3 feed posts a day (IST = UTC+5:30):
+#   05:07 UTC = 10:37 IST   10:37 UTC = 16:07 IST   15:37 UTC = 21:07 IST
+on:
+  schedule:
+    - cron: '7 5 * * *'
+    - cron: '37 10 * * *'
+    - cron: '37 15 * * *'
+  workflow_dispatch:
+    inputs:
+      style:
+        description: 'Screenshot style (snippet or full)'
+        required: false
+        default: 'snippet'
+        type: choice
+        options:
+          - snippet
+          - full
+      subreddit:
+        description: 'Optional: pin a specific subreddit (e.g. webdev, ExperiencedDevs)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ai-video-factory
+  cancel-in-progress: false
+
+jobs:
+  reddit-to-instagram:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Cache Obscura and Playwright Chromium
+        uses: actions/cache@v4
+        with:
+          path: |
+            .cache
+            ~/.cache/ms-playwright
+          key: factory-${{ runner.os }}-24.04-reddit-v1
+          restore-keys: |
+            factory-${{ runner.os }}-24.04-models-
+            factory-${{ runner.os }}-24.04-reddit-
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Install Obscura (cached in .cache/obscura)
+        run: |
+          mkdir -p .cache/obscura
+          if [ ! -x .cache/obscura/obscura ]; then
+            curl -fSL --retry 5 --retry-delay 3 --retry-all-errors \
+              https://github.com/h4ckf0r0day/obscura/releases/latest/download/obscura-x86_64-linux.tar.gz \
+              -o /tmp/obscura.tar.gz
+            tar -xzf /tmp/obscura.tar.gz -C .cache/obscura
+            rm -f /tmp/obscura.tar.gz
+            find .cache/obscura -type f \( -name 'obscura' -o -name 'obscura-worker' \) -exec chmod +x {} +
+          fi
+          OBSCURA_BIN="$(find "${{ github.workspace }}/.cache/obscura" -type f -name 'obscura' | head -n 1)"
+          echo "OBSCURA_PATH=$OBSCURA_BIN" >> "$GITHUB_ENV"
+          echo "$(dirname "$OBSCURA_BIN")" >> "$GITHUB_PATH"
+          "$OBSCURA_BIN" --version || true
+
+      - name: Install Playwright Chromium + fonts (resilient)
+        run: |
+          APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true"
+          retry() {
+            local n=1
+            until "$@"; do
+              if [ $n -ge 4 ]; then return 1; fi
+              echo "Command failed (attempt $n/4); retrying in $((n * 5))s..."
+              sleep $((n * 5))
+              n=$((n + 1))
+            done
+          }
+
+          retry sudo apt-get $APT_OPTS update || true
+          sudo apt-get $APT_OPTS install -y --no-install-recommends --fix-missing \
+            fonts-noto-color-emoji fonts-noto-core || true
+
+          if ! find ~/.cache/ms-playwright -maxdepth 2 -name 'chromium-*' 2>/dev/null | grep -q .; then
+            retry npx playwright install chromium
+          fi
+          retry sudo npx playwright install-deps chromium
+
+      - name: Scout viral Reddit opinion/tip & publish to Instagram
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: 'baidu/ernie-5.5-flash-preview:free'
+          IG_ACCESS_TOKEN: ${{ secrets.IG_ACCESS_TOKEN }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          IMGBB_API_KEY: ${{ secrets.IMGBB_API_KEY }}
+          REDDIT_SESSION_COOKIE: ${{ secrets.REDDIT_SESSION_COOKIE }}
+          TZ: Asia/Kolkata
+        run: |
+          ARGS="--reddit --publish instagram"
+          if [ "${{ inputs.style }}" = "full" ]; then
+            ARGS="$ARGS --full"
+          else
+            ARGS="$ARGS --snippet"
+          fi
+          if [ -n "${{ inputs.subreddit }}" ]; then
+            ARGS="$ARGS --subreddit ${{ inputs.subreddit }}"
+          fi
+          node main.js $ARGS --prompt "Focus on viral developer opinions, real-world tips, and practical tricks that spark comments and saves."
+
+      - name: Commit updated output/history.json
+        if: always()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p output
+          if [ -f output/history.json ]; then
+            git add -f output/history.json
+            if git diff --cached --quiet; then
+              echo "history.json unchanged"
+            else
+              git commit -m "chore: update history.json after Reddit IG post [skip ci]"
+              git pull --rebase origin "${{ github.ref_name }}"
+              git push
+            fi
+          else
+            echo "No output/history.json produced this run."
+          fi

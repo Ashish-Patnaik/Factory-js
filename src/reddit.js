@@ -1022,43 +1022,57 @@ export async function runRedditFlow(cfg, g, work, hooks = {}) {
   }
   checkLlm();
 
-  // 1) Resolve the post: --post-url, or random subreddit -> hot section -> AI pick.
+  // 1) Build subreddit queue: --post-url, pinned --subreddit, or shuffled list from sources_reddit.md
   const history = loadHistory();
-  let subreddit = null;
+  let subredditQueue = [];
   let post = null;
   if (g.post_url) {
     post = {
       permalink: validateUrl(g.post_url), title: '', selftext: '', score: 0, numComments: 0,
       author: 'unknown', flair: '', isText: true, subreddit: '',
     };
-    subreddit = 'direct post URL';
     if (history.has(post.permalink)) console.log('[reddit] note: this post is already in output/history.json (posting it again anyway - --post-url is explicit)');
   } else {
     const file = g.subreddits || 'sources_reddit.md';
     const subs = parseSubredditFile(file);
     if (g.subreddit) {
-      subreddit = subredditUrl(g.subreddit);
-      console.log(`[reddit] pinned subreddit: ${subreddit}`);
+      subredditQueue = [subredditUrl(g.subreddit)];
+      console.log(`[reddit] pinned subreddit: ${subredditQueue[0]}`);
     } else {
-      subreddit = subs[Math.floor(Math.random() * subs.length)];
-      console.log(`[reddit] random subreddit from ${file}: ${subreddit}`);
+      subredditQueue = [...subs].sort(() => Math.random() - 0.5);
+      console.log(`[reddit] shuffled ${subredditQueue.length} subreddits from ${file} (starting with ${subredditQueue[0]})`);
     }
   }
 
-  // 2) One browser session does everything: hot listing, post details, the screenshot.
+  // 2) One browser session does everything: hot listing (with multi-subreddit failover), post details, screenshot.
   const persona = await loadPersona(cfg.persona_file);
   if (!persona) console.log('[reddit] note: persona.md missing/unreadable - the AI will use a neutral voice');
   let captured = null;
   await withSession(cfg, async (page) => {
     if (!g.post_url) {
-      const hot = await fetchHotPosts(page, subreddit);
-      const fresh = hot.filter((p) => !history.has(p.permalink));
-      if (!fresh.length) {
-        die('every hot post on this subreddit is already in output/history.json - ' +
-          'add more subreddits to sources_reddit.md, use --subreddit <name>, or clear the history file');
+      let lastSubErr = null;
+      for (const sub of subredditQueue) {
+        try {
+          console.log(`[reddit] scanning hot posts on ${sub}...`);
+          const hot = await fetchHotPosts(page, sub);
+          const fresh = hot.filter((p) => !history.has(p.permalink));
+          if (!fresh.length) {
+            console.log(`[reddit] all hot posts on ${sub} are already in history; trying next subreddit...`);
+            continue;
+          }
+          console.log(`[reddit] ${fresh.length} fresh hot post(s) (${hot.length - fresh.length} already posted)`);
+          post = await pickWithFallback(cfg, persona, fresh, sub);
+          break;
+        } catch (e) {
+          lastSubErr = e;
+          console.log(`[reddit] ${sub} failed (${String(e?.message ?? e).split('\n')[0]}), trying next subreddit...`);
+        }
       }
-      console.log(`[reddit] ${fresh.length} fresh hot post(s) (${hot.length - fresh.length} already posted)`);
-      post = await pickWithFallback(cfg, persona, fresh, subreddit);
+      if (!post) {
+        die(lastSubErr
+          ? `all subreddits failed (last error: ${String(lastSubErr?.message ?? lastSubErr).split('\n')[0]})`
+          : 'every hot post across sources_reddit.md is already in output/history.json');
+      }
     }
     const detail = await fetchPostDetail(page, post.permalink);
     post = {
