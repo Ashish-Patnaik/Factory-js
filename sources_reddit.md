@@ -5,12 +5,12 @@
 # Everything after # is a comment.
 
 ### Tech & AI
-1. https://www.reddit.com/r/programming/ # general programming discussions, war stories, hot takes
+1. https://www.reddit.com/r/GTA6/ # general programming discussions, war stories, hot takes
 2. https://www.reddit.com/r/webdev/ # frontend/backend career and workflow stories
-3. https://www.reddit.com/r/ExperiencedDevs/ # senior-dev career advice, interview and salary stories
-4. https://www.reddit.com/r/cscareerquestions/ # interviews, offers, layoffs, career drama
-5. https://www.reddit.com/r/softwareengineering/ # engineering culture and practice debates
-6. https://www.reddit.com/r/javascript/ # language news, tooling drama, dev opinions
+3. https://www.reddit.com/r/interestingasfuck/ 
+4. https://www.reddit.com/r/IndiaTech/ # interviews, offers, layoffs, career drama
+5. https://www.reddit.com/r/LocalLLaMA/ # engineering culture and practice debates
+6. https://www.reddit.com/r/developersIndia/ # language news, tooling drama, dev opinions
 7. https://www.reddit.com/r/ChatGPT/ # AI workflows, prompts, AI-takes-the-job stories
 8. https://www.reddit.com/r/singularity/ # AI progress, predictions, hype and backlash
 9. https://www.reddit.com/r/artificial/ # AI news and opinion threads
