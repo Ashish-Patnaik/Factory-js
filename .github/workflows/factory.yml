@@ -35,13 +35,14 @@ jobs:
           path: |
             .cache
             ~/.cache/ms-playwright
-          key: factory-${{ runner.os }}-24.04-models-v3
+          key: factory-${{ runner.os }}-24.04-tinyvoca-v1
           restore-keys: |
-            factory-${{ runner.os }}-24.04-models-
+            factory-${{ runner.os }}-24.04-tinyvoca-
 
       - name: Install npm dependencies
         run: |
           npm ci
+          node scripts/setup-tts.mjs
           node scripts/setup-asr.mjs
 
       - name: Install Obscura (cached in .cache/obscura)
