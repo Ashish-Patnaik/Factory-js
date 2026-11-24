@@ -330,6 +330,22 @@ async function downloadSingleStream(ytdlp, videoUrl, formatId, outPath) {
   if (!fs.existsSync(outPath)) throw new Error('yt-dlp did not create output file');
   return outPath;
 }
+async function downloadClipSection(ytdlp, videoUrl, formatSpec, outPath, startSec, endSec) {
+  const s0 = Math.max(0, Math.floor(startSec));
+  const s1 = Math.max(s0 + 2, Math.ceil(endSec));
+  if (fs.existsSync(outPath)) fs.rmSync(outPath, { force: true });
+  await runCmd(ytdlp, [
+    '-f', String(formatSpec),
+    '--download-sections', `*${s0}-${s1}`,
+    '--merge-output-format', 'mp4',
+    '--downloader-args', 'ffmpeg_i:-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    '--no-playlist', '--no-warnings', '--no-part', '--force-overwrites',
+    '-o', outPath,
+    videoUrl,
+  ], { timeoutMs: 180000 });
+  if (!fs.existsSync(outPath)) throw new Error('yt-dlp did not create clip section file');
+  return outPath;
+}
 
 // ---------------------------------------------------------------------------
 // 3. Timestamped Transcript: YouTube Captions (fast) -> phonon-2-web ASR (fallback)
@@ -804,45 +820,55 @@ export async function runGtaFlow(cfg, g, work) {
   const host = await new EncoderHost().launch({ channel: cfg.encoder_channel ?? null });
   let hasSeparateAudio = false;
   let downloadedVideo = false;
+  let downloadedAudio = false;
 
   try {
     if (chosen.localFile) {
       server.setFile('/video', chosen.localFile, 'video/mp4');
-    } else {
-      server.setProxy('/video', videoFormat.url, videoFormat.http_headers ?? {});
-      if (audioFormat) {
-        server.setProxy('/audio', audioFormat.url, audioFormat.http_headers ?? {});
-        hasSeparateAudio = true;
-      }
     }
 
     // 4) Extract timestamped transcript inside [safe.start, safe.end]
     //    Path A: YouTube subtitles / auto-captions (instant)
-    //    Path B: On-device phonon-2-web ASR fallback (when no YT captions or local file)
+    //    Path B: On-device phonon-2-web ASR fallback on a LOCAL file (never proxy googlevideo.com)
     let transcriptBlocks = resolved
       ? await fetchYoutubeTranscript(resolved.subtitles, resolved.automaticCaptions, safe.start, safe.end)
       : null;
 
     if (!transcriptBlocks && !g.gta_no_asr) {
-      const audioRoute = hasSeparateAudio ? `${server.baseUrl}/audio` : `${server.baseUrl}/video`;
       try {
-        transcriptBlocks = await transcribeSafeWindowWithAsr(host, audioRoute, safe.start, safe.end, meta.heatmap);
-      } catch (asrErr) {
-        // If proxied audio stream failed, download the lightweight M4A audio stream and retry ASR once
-        if (!chosen.localFile && audioFormat) {
-          try {
-            console.log(`[gta] audio proxy failed for ASR (${String(asrErr?.message ?? asrErr).split('\n')[0]}); downloading M4A audio...`);
-            const dlAudio = path.join(work, `asr_${chosen.id}.m4a`);
-            await downloadSingleStream(ytdlp, chosen.url, audioFormat.format_id, dlAudio);
-            server.setFile('/audio', dlAudio, 'audio/mp4');
-            hasSeparateAudio = true;
-            transcriptBlocks = await transcribeSafeWindowWithAsr(host, `${server.baseUrl}/audio`, safe.start, safe.end, meta.heatmap);
-          } catch (e2) {
-            console.log(`[gta] ASR fallback skipped (${String(e2?.message ?? e2).split('\n')[0]})`);
-          }
-        } else {
-          console.log(`[gta] ASR fallback skipped (${String(asrErr?.message ?? asrErr).split('\n')[0]})`);
+        let audioRoute = null;
+        if (chosen.localFile) {
+          audioRoute = `${server.baseUrl}/video`;
+        } else if (audioFormat) {
+          console.log('[gta] downloading M4A audio locally for ASR (avoids YouTube stream proxy drops)...');
+          const dlAudio = path.join(work, `asr_${chosen.id}.m4a`);
+          await downloadSingleStream(ytdlp, chosen.url, audioFormat.format_id, dlAudio);
+          server.setFile('/audio', dlAudio, 'audio/mp4');
+          hasSeparateAudio = true;
+          downloadedAudio = true;
+          audioRoute = `${server.baseUrl}/audio`;
+        } else if (videoFormat) {
+          // Muxed-only video: download just the 6-min ASR window locally
+          const safeSpan = safe.end - safe.start;
+          const anchor = meta.heatmap?.[0]?.start ?? (safe.start + safeSpan * 0.5);
+          const wStart = safeSpan > ASR_MAX_WINDOW_SEC
+            ? Math.max(safe.start, Math.min(safe.end - ASR_MAX_WINDOW_SEC, anchor - ASR_MAX_WINDOW_SEC / 2))
+            : safe.start;
+          const wEnd = Math.min(safe.end, wStart + ASR_MAX_WINDOW_SEC);
+          console.log(`[gta] downloading ${Math.round(wEnd - wStart)}s local audio slice for ASR...`);
+          const dlSlice = path.join(work, `asr_slice_${chosen.id}.mp4`);
+          await downloadClipSection(ytdlp, chosen.url, videoFormat.format_id, dlSlice, wStart, wEnd);
+          server.setFile('/audio', dlSlice, 'video/mp4');
+          // Local slice starts at 0s -> run ASR over [0, wEnd - wStart], then shift timestamps back by +wStart
+          const rawBlocks = await transcribeSafeWindowWithAsr(host, `${server.baseUrl}/audio`, 0, wEnd - wStart, []);
+          transcriptBlocks = rawBlocks?.map((b) => ({ start: b.start + wStart, end: b.end + wStart, text: b.text })) ?? null;
         }
+
+        if (audioRoute) {
+          transcriptBlocks = await transcribeSafeWindowWithAsr(host, audioRoute, safe.start, safe.end, meta.heatmap);
+        }
+      } catch (asrErr) {
+        console.log(`[gta] ASR fallback skipped (${String(asrErr?.message ?? asrErr).split('\n')[0]})`);
       }
     }
 
@@ -915,37 +941,66 @@ export async function runGtaFlow(cfg, g, work) {
     const { pcm, sampleRate } = readWav(wav);
     await host.deliverAudio(pcm, { sampleRate, audioDelay: 0, totalDuration: secs });
 
+    let renderStart = clipStart;
+    let renderEnd = clipEnd;
+    let useSeparateAudio = hasSeparateAudio && gameAudioGain > 0;
+
+    if (!chosen.localFile && videoFormat && !downloadedVideo) {
+      const { probeMedia } = await import('./utils.js');
+      const dlClip = path.join(work, `clip_${chosen.id}.mp4`);
+      const formatSpec = (audioFormat && gameAudioGain > 0)
+        ? `${videoFormat.format_id}+${audioFormat.format_id}`
+        : String(videoFormat.format_id);
+      const sliceEnd = meta.duration > 0 ? Math.min(meta.duration, clipEnd + 5) : clipEnd + 5;
+
+      let slicedOk = false;
+      try {
+        console.log(`[gta] downloading local ${Math.ceil(sliceEnd - clipStart)}s clip slice (${fmtTime(clipStart)} -> ${fmtTime(sliceEnd)})...`);
+        await downloadClipSection(ytdlp, chosen.url, formatSpec, dlClip, clipStart, sliceEnd);
+        const pm = await probeMedia(dlClip);
+        if (pm?.video && pm.duration >= Math.max(2, clipLen - 2)) {
+          server.setFile('/video', dlClip, 'video/mp4');
+          downloadedVideo = true;
+          renderStart = 0;
+          renderEnd = Math.min(clipLen, pm.duration);
+          useSeparateAudio = false; // audio is already muxed & synced inside dlClip
+          slicedOk = true;
+        }
+      } catch (sliceErr) {
+        console.log(`[gta] section download unavailable (${String(sliceErr?.message ?? sliceErr).split('\n')[0]}); falling back to full MP4 download...`);
+      }
+
+      if (!slicedOk) {
+        const dlVideo = path.join(work, `src_${chosen.id}.mp4`);
+        await downloadSingleStream(ytdlp, chosen.url, videoFormat.format_id, dlVideo);
+        server.setFile('/video', dlVideo, 'video/mp4');
+        downloadedVideo = true;
+        if (audioFormat && gameAudioGain > 0 && !downloadedAudio) {
+          const dlAudio = path.join(work, `src_${chosen.id}.m4a`);
+          try {
+            await downloadSingleStream(ytdlp, chosen.url, audioFormat.format_id, dlAudio);
+            server.setFile('/audio', dlAudio, 'audio/mp4');
+            hasSeparateAudio = true;
+            downloadedAudio = true;
+            useSeparateAudio = true;
+          } catch {
+            server.clear('/audio');
+            hasSeparateAudio = false;
+            useSeparateAudio = false;
+          }
+        }
+      }
+    }
+
     const renderArgs = () => ({
       videoUrl: `${server.baseUrl}/video`,
-      audioUrl: (hasSeparateAudio && gameAudioGain > 0) ? `${server.baseUrl}/audio` : null,
-      startSec: clipStart, endSec: clipEnd, fps: cfg.fps, width: 1080, height: 1920,
+      audioUrl: useSeparateAudio ? `${server.baseUrl}/audio` : null,
+      startSec: renderStart, endSec: renderEnd, fps: cfg.fps, width: 1080, height: 1920,
       quality: cfg.quality, bitrate: cfg.bitrate ?? null, fit, gameAudioGain,
     });
 
-    let info;
     console.log(`[gta] rendering 9:16 clip (${fit}) with captions...`);
-    try {
-      info = await host.rpc('renderVideoClip', renderArgs());
-    } catch (proxyErr) {
-      if (chosen.localFile || !videoFormat || downloadedVideo) throw proxyErr;
-      console.log(`[gta] stream proxy interrupted (${String(proxyErr?.message ?? proxyErr).split('\n')[0]}); downloading MP4 locally...`);
-      const dlVideo = path.join(work, `src_${chosen.id}.mp4`);
-      await downloadSingleStream(ytdlp, chosen.url, videoFormat.format_id, dlVideo);
-      server.setFile('/video', dlVideo, 'video/mp4');
-      downloadedVideo = true;
-      if (audioFormat && gameAudioGain > 0 && !fs.existsSync(path.join(work, `asr_${chosen.id}.m4a`))) {
-        const dlAudio = path.join(work, `src_${chosen.id}.m4a`);
-        try {
-          await downloadSingleStream(ytdlp, chosen.url, audioFormat.format_id, dlAudio);
-          server.setFile('/audio', dlAudio, 'audio/mp4');
-          hasSeparateAudio = true;
-        } catch {
-          server.clear('/audio');
-          hasSeparateAudio = false;
-        }
-      }
-      info = await host.rpc('renderVideoClip', renderArgs());
-    }
+    const info = await host.rpc('renderVideoClip', renderArgs());
     await host.rpc('finish');
     await host.pullToFile(outPath);
     console.log(`done: ${info.frames} frames in ${(info.ms / 1000).toFixed(1)}s`);
