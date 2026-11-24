@@ -282,25 +282,32 @@ function runCmd(bin, args, { timeoutMs = 120000 } = {}) {
 async function resolveYtVideo(ytdlp, videoUrl) {
   const stdout = await runCmd(ytdlp, [
     '--dump-single-json', '--no-warnings', '--no-playlist', videoUrl,
-  ], { timeoutMs: 45000 });
+  ], { timeoutMs: 120000 });
   const info = JSON.parse(stdout);
   const formats = Array.isArray(info.formats) ? info.formats : [];
+
+  const isDirect = (f) => !String(f.protocol ?? '').includes('m3u8') && !/\.m3u8(\?|$)/i.test(String(f.url ?? ''));
 
   const h264 = formats
     .filter((f) => f.url && f.ext === 'mp4' && /^avc1/i.test(String(f.vcodec ?? '')) &&
       (f.height ?? 0) >= 360 && (f.height ?? 0) <= 1080)
     .sort((a, b) =>
+      (Number(isDirect(b)) - Number(isDirect(a))) ||
       ((b.height ?? 0) - (a.height ?? 0)) ||
       ((b.fps ?? 0) - (a.fps ?? 0)) ||
       (Number(b.acodec && b.acodec !== 'none') - Number(a.acodec && a.acodec !== 'none')));
 
-  const videoFormat = h264[0] ?? formats.find((f) => f.url && f.ext === 'mp4' && f.vcodec !== 'none');
+  const videoFormat = h264[0]
+    ?? formats.find((f) => f.url && isDirect(f) && f.ext === 'mp4' && f.vcodec !== 'none')
+    ?? formats.find((f) => f.url && f.ext === 'mp4' && f.vcodec !== 'none');
   if (!videoFormat) throw new Error('no H.264 MP4 stream available for this video');
 
   const hasMuxedAudio = videoFormat.acodec && videoFormat.acodec !== 'none';
   const audioFormat = hasMuxedAudio ? null : (formats
     .filter((f) => f.url && (f.ext === 'm4a' || f.ext === 'mp4') && f.vcodec === 'none' && f.acodec && f.acodec !== 'none')
-    .sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0] ?? null);
+    .sort((a, b) =>
+      (Number(isDirect(b)) - Number(isDirect(a))) ||
+      ((b.abr ?? 0) - (a.abr ?? 0)))[0] ?? null);
 
   return {
     title: info.title ?? '',
@@ -714,17 +721,29 @@ export async function runGtaFlow(cfg, g, work) {
     }
   }
 
-  // 1) Pick the video (local file, --gta-url, or latest GTA 6 upload from source-gta.md)
+  // 1) Pick the video & 2) Resolve stream + metadata (with automatic candidate failover)
   const history = loadHistory();
   let chosen = null;
+  let resolved = null;
+  let meta = { title: '', channel: '', duration: 0, description: '', heatmap: [], chapters: [] };
+  let videoFormat = null, audioFormat = null;
+
   if (g.gta_file) {
     const abs = path.resolve(g.gta_file);
     if (!fs.existsSync(abs)) die(`--gta-file not found: ${abs}`);
     chosen = { localFile: abs, url: `file://${abs}`, id: 'local', title: path.basename(abs, path.extname(abs)), channel: 'local', duration: 0 };
+    const { probeMedia } = await import('./utils.js');
+    const pm = await probeMedia(chosen.localFile);
+    meta = { title: chosen.title, channel: chosen.channel, duration: pm.duration || 60, description: '', heatmap: [], chapters: [] };
   } else if (g.gta_url) {
     const id = extractVideoId(g.gta_url);
     if (!id) die(`--gta-url is not a valid YouTube video URL: ${g.gta_url}`);
     chosen = { id, url: canonicalYtUrl(id), title: g.gta_url, channel: '', duration: 0 };
+    console.log(`[gta] fetching stream, captions & highlight metadata for ${chosen.url}`);
+    resolved = await resolveYtVideo(ytdlp, chosen.url);
+    meta = { title: resolved.title, channel: resolved.channel, duration: resolved.duration, description: resolved.description, heatmap: [], chapters: [] };
+    videoFormat = resolved.videoFormat;
+    audioFormat = resolved.audioFormat;
   } else {
     const srcFile = g.gta_sources || 'source-gta.md';
     const channels = parseGtaSources(srcFile);
@@ -733,27 +752,26 @@ export async function runGtaFlow(cfg, g, work) {
       die(`no fresh GTA 6 videos found in ${srcFile} (or all latest uploads are already in output/history.json).`);
     }
     console.log(`[gta] found ${candidates.length} fresh GTA 6 video(s) across channels`);
-    chosen = await aiPickVideo(cfg, persona, candidates);
-  }
 
-  // 2) Resolve stream + metadata (heatmap, chapters, subtitles)
-  let resolved = null;
-  let meta = { title: chosen.title, channel: chosen.channel, duration: chosen.duration, description: '', heatmap: [], chapters: [] };
-  let videoFormat = null, audioFormat = null;
+    const topPick = await aiPickVideo(cfg, persona, candidates);
+    const queue = [topPick, ...candidates.filter((c) => c.id !== topPick.id)].slice(0, 4);
 
-  if (chosen.localFile) {
-    const { probeMedia } = await import('./utils.js');
-    const pm = await probeMedia(chosen.localFile);
-    meta.duration = pm.duration || 60;
-  } else {
-    console.log(`[gta] fetching stream, captions & highlight metadata for ${chosen.url}`);
-    resolved = await resolveYtVideo(ytdlp, chosen.url);
-    meta.title = resolved.title;
-    meta.channel = resolved.channel;
-    meta.duration = resolved.duration;
-    meta.description = resolved.description;
-    videoFormat = resolved.videoFormat;
-    audioFormat = resolved.audioFormat;
+    let lastErr = null;
+    for (const cand of queue) {
+      console.log(`[gta] fetching stream, captions & highlight metadata for ${cand.url}`);
+      try {
+        resolved = await resolveYtVideo(ytdlp, cand.url);
+        chosen = cand;
+        meta = { title: resolved.title, channel: resolved.channel, duration: resolved.duration, description: resolved.description, heatmap: [], chapters: [] };
+        videoFormat = resolved.videoFormat;
+        audioFormat = resolved.audioFormat;
+        break;
+      } catch (e) {
+        lastErr = e;
+        console.log(`[gta] failed to resolve ${cand.url} (${String(e?.message ?? e).split('\n')[0]}), trying next candidate...`);
+      }
+    }
+    if (!resolved) throw lastErr ?? new Error('could not resolve any candidate GTA 6 video');
   }
 
   // 3) Compute safe clip window (skips first 2 min & last 2 min)
