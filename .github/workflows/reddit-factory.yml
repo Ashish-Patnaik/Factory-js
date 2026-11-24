@@ -50,10 +50,9 @@ jobs:
           path: |
             .cache
             ~/.cache/ms-playwright
-          key: factory-${{ runner.os }}-24.04-reddit-v1
+          key: factory-${{ runner.os }}-24.04-reddit-v2
           restore-keys: |
-            factory-${{ runner.os }}-24.04-models-
-            factory-${{ runner.os }}-24.04-reddit-
+            factory-${{ runner.os }}-24.04-reddit-v2
 
       - name: Install npm dependencies
         run: npm ci
