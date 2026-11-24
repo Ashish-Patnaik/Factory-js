@@ -83,15 +83,15 @@ jobs:
           fi
           retry sudo npx playwright install-deps chromium
 
-      # 7. Install latest yt-dlp + BotGuard PO Token plugin
+      # 7. Install latest yt-dlp (with EJS + curl-cffi) & BotGuard PO Token plugin
       - name: Install yt-dlp & PO Token plugin
         run: |
           python3 -m pip install --retries 5 --user --break-system-packages --upgrade \
-            yt-dlp \
+            "yt-dlp[default,curl-cffi]" \
             bgutil-ytdlp-pot-provider
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      # 8. Start local BotGuard PO Token server (bypasses datacenter bot checks)
+      # 8. Start local BotGuard PO Token server
       - name: Start YouTube PO Token provider (bgutil)
         run: |
           docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider || true
@@ -103,55 +103,82 @@ jobs:
             sleep 1
           done
 
-      # 9. Auto-configure yt-dlp (probes PO-token cookieless first, falls back to YT_COOKIES_B64)
+      # 9. Auto-configure yt-dlp using its maintained default clients (no dead player_client overrides)
       - name: Configure resilient yt-dlp auth & client fallback
         env:
           YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
+          YT_PROXY: ${{ secrets.YT_PROXY }}
         run: |
           mkdir -p "$HOME/.config/yt-dlp"
           CONF="$HOME/.config/yt-dlp/config"
           TEST_URL="https://www.youtube.com/watch?v=jNQXAC9IVRw"
 
           if [ -n "$YT_COOKIES_B64" ]; then
-            echo "$YT_COOKIES_B64" | base64 --decode > /tmp/yt_cookies.txt
+            printf '%s' "$YT_COOKIES_B64" | tr -d '\r\n ' | base64 --decode > /tmp/yt_cookies.txt
             chmod 600 /tmp/yt_cookies.txt
+            echo "[yt-dlp] decoded YT_COOKIES_B64 ($(wc -l < /tmp/yt_cookies.txt) lines)"
+          else
+            echo "[yt-dlp] note: YT_COOKIES_B64 secret is not set"
           fi
 
           write_base_conf() {
-            cat > "$CONF" <<'EOF'
-          --js-runtimes deno
-          --remote-components ejs:github
-          --retries 5
-          --fragment-retries 5
-          --sleep-requests 1
-          EOF
+            printf '%s\n' \
+              "--js-runtimes deno" \
+              "--remote-components ejs:github" \
+              "--retries 5" \
+              "--fragment-retries 5" \
+              "--sleep-requests 1" > "$CONF"
+            if [ -n "$YT_PROXY" ]; then
+              printf '%s\n' "--proxy $YT_PROXY" >> "$CONF"
+            fi
           }
 
-          # Tier 1: Cookieless PO-token + mobile/TV/VR clients (keeps cookies untouched when possible)
+          probe_ytdlp() {
+            local label="$1"
+            local out
+            if out=$(yt-dlp --skip-download --no-playlist -f "bv*[ext=mp4]/b[ext=mp4]/bv*/b" --get-url "$TEST_URL" 2>&1); then
+              echo "[yt-dlp] OK -> $label"
+              return 0
+            else
+              echo "[yt-dlp] FAILED -> $label"
+              printf '%s\n' "$out" | tail -n 8
+              return 1
+            fi
+          }
+
+          # Tier 1: yt-dlp maintained default clients (tv_samsung/visionos) + bgutil PO token, cookieless
           write_base_conf
-          echo '--extractor-args "youtube:player_client=mweb,tv_simply,android_vr"' >> "$CONF"
-          if yt-dlp --skip-download --no-warnings -f "b/bv*" --get-url "$TEST_URL" >/dev/null 2>&1; then
-            echo "[yt-dlp] Tier 1 active: cookieless PO-token + mweb/tv_simply/android_vr"
+          if probe_ytdlp "Tier 1: default clients + PO token (cookieless)"; then
             exit 0
           fi
 
-          # Tier 2: Authenticated cookies + PO-token (handles strict Azure IP blocks)
+          # Tier 2: yt-dlp maintained default clients + cookies + PO token
           if [ -s /tmp/yt_cookies.txt ]; then
             write_base_conf
-            echo '--cookies /tmp/yt_cookies.txt' >> "$CONF"
-            echo '--extractor-args "youtube:player_client=tv,web,mweb"' >> "$CONF"
-            if yt-dlp --skip-download --no-warnings -f "b/bv*" --get-url "$TEST_URL" >/dev/null 2>&1; then
-              echo "[yt-dlp] Tier 2 active: YT_COOKIES_B64 + PO-token"
+            printf '%s\n' "--cookies /tmp/yt_cookies.txt" >> "$CONF"
+            if probe_ytdlp "Tier 2: default clients + YT_COOKIES_B64 + PO token"; then
               exit 0
             fi
-            echo "[yt-dlp] warning: YT_COOKIES_B64 probe failed (cookies may have expired); trying android_vr..."
-          else
-            echo "[yt-dlp] note: YT_COOKIES_B64 secret not set; trying standalone android_vr..."
+
+            # Tier 3: default + mweb + web_creator + cookies + PO token
+            write_base_conf
+            printf '%s\n' \
+              "--cookies /tmp/yt_cookies.txt" \
+              '--extractor-args "youtube:player_client=default,mweb,web_creator"' >> "$CONF"
+            if probe_ytdlp "Tier 3: default,mweb,web_creator + YT_COOKIES_B64 + PO token"; then
+              exit 0
+            fi
           fi
 
-          # Tier 3: Last-resort standalone android_vr client
+          # Tier 4: default + web_safari/mweb cookieless fallback
           write_base_conf
-          echo '--extractor-args "youtube:player_client=android_vr"' >> "$CONF"
+          printf '%s\n' '--extractor-args "youtube:player_client=default,mweb,web_safari"' >> "$CONF"
+          if probe_ytdlp "Tier 4: default,mweb,web_safari (cookieless)"; then
+            exit 0
+          fi
+
+          echo "::error::All yt-dlp probe tiers failed on this runner IP. Check the failure lines above (add/refresh YT_COOKIES_B64 or set optional YT_PROXY)."
+          exit 1
 
       # 10. Verify dependencies
       - name: Verify GTA dependencies
