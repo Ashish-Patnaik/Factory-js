@@ -684,6 +684,7 @@ ${transcriptText}
 2. Write a punchy spoken AI voiceover script reacting to WHAT ACTUALLY HAPPENS in this ${gameLabel} clip:
    - Sentence 1 MUST be a scroll-stopping hook.
    - Ground the narration in the real details from the clip title and transcript above. Never call a GTA V clip "GTA 6".
+   - Do not include the player/streamer or channel name.  
    - Plain spoken English ONLY for TTS: NO markdown, NO emojis, NO hashtags, NO stage directions, NEVER read URLs aloud.
    - HARD LENGTH CAP: at most ${maxWords} words (MUST finish in under ${targetSecs} seconds when spoken, target ${Math.floor(maxWords * 0.82)} words).
    - End with a short comment-driving question.${extra}
