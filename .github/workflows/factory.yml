@@ -2,7 +2,8 @@ name: AI Content Factory
 
 on:
   schedule:
-    - cron: '37 3,7,11,17 * * *'
+    - cron: '7 7 * * *'   # 12:37 PM IST
+    - cron: '7 13 * * *'  # 6:37 PM IST
   workflow_dispatch:
 
 permissions:
