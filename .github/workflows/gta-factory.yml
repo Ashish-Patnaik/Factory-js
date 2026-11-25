@@ -1,4 +1,4 @@
-name: GTA 6 AI Shorts Factory
+name: GTA AI Shorts Factory (Twitch Clips)
 
 on:
   schedule:
@@ -18,30 +18,21 @@ concurrency:
 jobs:
   produce-and-publish:
     runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    timeout-minutes: 60
 
     steps:
-      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
-      # 2. Setup Node.js
-      - name: Setup Node.js
+      - name: Setup Node.js 22
         uses: actions/setup-node@v4
         with:
           node-version: '22'
           cache: 'npm'
 
-      # 3. Setup Deno for YouTube JS challenge solving
-      - name: Setup Deno
-        uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-
-      # 4. Cache models and Playwright Chromium
-      - name: Cache application files
+      - name: Cache tiny-voca TTS, ASR model, and Playwright Chromium
         uses: actions/cache@v4
         with:
           path: |
@@ -51,15 +42,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-24.04-gta-tinyvoca-
 
-      # 5. Install Node dependencies & verify ASR engine
-      - name: Install Node dependencies & setup ASR
+      - name: Install Node dependencies & setup TTS/ASR
         run: |
           npm ci
           node scripts/setup-tts.mjs
           node scripts/setup-asr.mjs
 
-      # 6. Install FFmpeg, fonts, and Playwright Chromium (with retries)
-      - name: Install system dependencies & Playwright Chromium
+      - name: Install Playwright Chromium + fonts (resilient)
         run: |
           APT_OPTS="-o Acquire::Retries=5 -o Acquire::http::Timeout=30 -o Acquire::ForceIPv4=true"
           retry() {
@@ -73,124 +62,21 @@ jobs:
           }
 
           retry sudo apt-get $APT_OPTS update || true
-          retry sudo apt-get $APT_OPTS install -y --no-install-recommends --fix-missing \
-            ffmpeg \
-            fonts-liberation \
-            fonts-noto-color-emoji \
-            fonts-dejavu-core || true
+          sudo apt-get $APT_OPTS install -y --no-install-recommends --fix-missing \
+            fonts-liberation fonts-noto-color-emoji fonts-dejavu-core || true
 
           if ! find ~/.cache/ms-playwright -maxdepth 2 -name 'chromium-*' 2>/dev/null | grep -q .; then
             retry npx playwright install chromium
           fi
           retry sudo npx playwright install-deps chromium
 
-      # 7. Install latest yt-dlp (with EJS + curl-cffi) & BotGuard PO Token plugin
-      - name: Install yt-dlp & PO Token plugin
+      - name: Install twitch-dl
         run: |
-          python3 -m pip install --retries 5 --user --break-system-packages --upgrade \
-            "yt-dlp[default,curl-cffi]" \
-            bgutil-ytdlp-pot-provider
+          python3 -m pip install --retries 5 --user --break-system-packages --upgrade twitch-dl
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/twitch-dl" --version
 
-      # 8. Start local BotGuard PO Token server
-      - name: Start YouTube PO Token provider (bgutil)
-        run: |
-          docker run --name bgutil-provider -d -p 4416:4416 --init brainicism/bgutil-ytdlp-pot-provider || true
-          for i in $(seq 1 15); do
-            if curl -sf http://127.0.0.1:4416/ping >/dev/null 2>&1; then
-              echo "bgutil PO token server is ready on :4416"
-              break
-            fi
-            sleep 1
-          done
-
-      # 9. Auto-configure yt-dlp using its maintained default clients (no dead player_client overrides)
-      - name: Configure resilient yt-dlp auth & client fallback
-        env:
-          YT_COOKIES_B64: ${{ secrets.YT_COOKIES_B64 }}
-          YT_PROXY: ${{ secrets.YT_PROXY }}
-        run: |
-          mkdir -p "$HOME/.config/yt-dlp"
-          CONF="$HOME/.config/yt-dlp/config"
-          TEST_URL="https://www.youtube.com/watch?v=jNQXAC9IVRw"
-
-          if [ -n "$YT_COOKIES_B64" ]; then
-            printf '%s' "$YT_COOKIES_B64" | tr -d '\r\n ' | base64 --decode > /tmp/yt_cookies.txt
-            chmod 600 /tmp/yt_cookies.txt
-            echo "[yt-dlp] decoded YT_COOKIES_B64 ($(wc -l < /tmp/yt_cookies.txt) lines)"
-          else
-            echo "[yt-dlp] note: YT_COOKIES_B64 secret is not set"
-          fi
-
-          write_base_conf() {
-            printf '%s\n' \
-              "--js-runtimes deno" \
-              "--remote-components ejs:github" \
-              "--retries 5" \
-              "--fragment-retries 5" \
-              "--sleep-requests 1" > "$CONF"
-            if [ -n "$YT_PROXY" ]; then
-              printf '%s\n' "--proxy $YT_PROXY" >> "$CONF"
-            fi
-          }
-
-          probe_ytdlp() {
-            local label="$1"
-            local out
-            if out=$(yt-dlp --skip-download --no-playlist -f "bv*[ext=mp4]/b[ext=mp4]/bv*/b" --get-url "$TEST_URL" 2>&1); then
-              echo "[yt-dlp] OK -> $label"
-              return 0
-            else
-              echo "[yt-dlp] FAILED -> $label"
-              printf '%s\n' "$out" | tail -n 8
-              return 1
-            fi
-          }
-
-          # Tier 1: yt-dlp maintained default clients (tv_samsung/visionos) + bgutil PO token, cookieless
-          write_base_conf
-          if probe_ytdlp "Tier 1: default clients + PO token (cookieless)"; then
-            exit 0
-          fi
-
-          # Tier 2: yt-dlp maintained default clients + cookies + PO token
-          if [ -s /tmp/yt_cookies.txt ]; then
-            write_base_conf
-            printf '%s\n' "--cookies /tmp/yt_cookies.txt" >> "$CONF"
-            if probe_ytdlp "Tier 2: default clients + YT_COOKIES_B64 + PO token"; then
-              exit 0
-            fi
-
-            # Tier 3: default + mweb + web_creator + cookies + PO token
-            write_base_conf
-            printf '%s\n' \
-              "--cookies /tmp/yt_cookies.txt" \
-              '--extractor-args "youtube:player_client=default,mweb,web_creator"' >> "$CONF"
-            if probe_ytdlp "Tier 3: default,mweb,web_creator + YT_COOKIES_B64 + PO token"; then
-              exit 0
-            fi
-          fi
-
-          # Tier 4: default + web_safari/mweb cookieless fallback
-          write_base_conf
-          printf '%s\n' '--extractor-args "youtube:player_client=default,mweb,web_safari"' >> "$CONF"
-          if probe_ytdlp "Tier 4: default,mweb,web_safari (cookieless)"; then
-            exit 0
-          fi
-
-          echo "::error::All yt-dlp probe tiers failed on this runner IP. Check the failure lines above (add/refresh YT_COOKIES_B64 or set optional YT_PROXY)."
-          exit 1
-
-      # 10. Verify dependencies
-      - name: Verify GTA dependencies
-        run: |
-          node --version
-          yt-dlp --version
-          ffmpeg -version | head -n 1 || true
-          deno --version
-
-      # 11. Restore YouTube OAuth credentials
-      - name: Restore YouTube credentials
+      - name: Restore YouTube OAuth credentials
         env:
           YT_CLIENT_SECRETS_B64: ${{ secrets.YT_CLIENT_SECRETS_B64 }}
           YT_TOKEN_JSON_B64: ${{ secrets.YT_TOKEN_JSON_B64 }}
@@ -198,9 +84,12 @@ jobs:
           echo "$YT_CLIENT_SECRETS_B64" | base64 --decode > client_secrets.json
           echo "$YT_TOKEN_JSON_B64" | base64 --decode > token.json
 
-      # 12. Generate and publish GTA Shorts
       - name: Generate and publish GTA Shorts
         env:
+          TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
+          TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          TWITCH_GAMES: 'Grand Theft Auto VI,Grand Theft Auto V'
+          TWITCH_LOOKBACK_HOURS: '48'
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           OPENROUTER_MODEL: 'baidu/ernie-5.5-flash-preview:free'
@@ -210,14 +99,10 @@ jobs:
           TZ: Asia/Kolkata
         run: node main.js --gta --random --publish all
 
-      # 13. Cleanup credentials & cookies
-      - name: Cleanup OAuth credentials & cookies
+      - name: Cleanup OAuth credentials
         if: always()
-        run: |
-          rm -f client_secrets.json token.json /tmp/yt_cookies.txt
-          docker rm -f bgutil-provider >/dev/null 2>&1 || true
+        run: rm -f client_secrets.json token.json
 
-      # 14. Commit generation history
       - name: Commit history
         if: always()
         run: |

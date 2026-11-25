@@ -23,6 +23,13 @@ import { EncoderHost } from './encoder/host.js';
 import { readWav } from './tts.js';
 import * as asr from './asr.js';
 import { ROOT, die, probe } from './utils.js';
+import {
+  hasTwitchCredentials,
+  extractTwitchClipSlug,
+  canonicalTwitchClipUrl,
+  fetchTrendingGtaClips,
+  downloadTwitchClip,
+} from './twitchClips.js';
 
 const GTA_OUT_DIR = path.join('output', 'gta');
 const DEFAULT_TRIM_MARGIN = 120; // skip first 2 minutes & last 2 minutes (intro/outro guard)
@@ -593,31 +600,34 @@ async function createMediaServer() {
 // ---------------------------------------------------------------------------
 async function aiPickVideo(cfg, persona, candidates) {
   const listing = candidates.slice(0, 35).map((c, i) =>
-    `${i}. [${c.title}] (${c.channel} | ${c.duration ? fmtTime(c.duration) : '?'} | ${c.published || 'recent'} | ${c.views || ''})`).join('\n');
+    `${i}. [${c.title}] (${c.gameName || 'GTA'} | ${c.channel} | ${c.duration ? fmtTime(c.duration) : '?'} | ${c.published || 'recent'} | ${c.views || ''})`).join('\n');
 
-  const prompt = `You are a viral gaming Shorts director scouting the coolest latest GTA 6 gameplay video to clip into a 9:16 Short/Reel.
+  const prompt = `You are a viral gaming Shorts director scouting the coolest fresh GTA gameplay clip to turn into a 9:16 Short/Reel.
 
 Creator Persona:
 ${persona}
 
-Latest GTA 6 Videos From Our Trusted Channels:
+Fresh Trending GTA Clips:
 ${listing}
 
-Pick the single BEST, most viral, hook-worthy GTA 6 video (insane details, physics, chases, NPCs, Vice City/Leonida showcase, stunts, or hot new gameplay). Prefer newer uploads.
+Pick the single BEST, most viral, hook-worthy clip (insane physics, police chases, wild NPCs, stunts, fails, Vice City/Los Santos chaos, or jaw-dropping gameplay). Prefer Grand Theft Auto VI when available and exciting, otherwise pick the highest-action GTA clip.
 
 Return ONLY valid JSON:
-{"pick": 0, "reason": "One sentence explaining why this makes the best viral GTA 6 Short."}`;
+{"pick": 0, "reason": "One sentence explaining why this makes the best viral GTA Short."}`;
 
   const data = extractJson(await llm(cfg, prompt));
   let idx = Number(data.pick);
   if (!Number.isInteger(idx) || idx < 0 || idx >= candidates.length) idx = 0;
-  console.log(`[gta] AI pick: "${candidates[idx].title}" — ${data.reason ?? 'viral GTA 6 hook'}`);
+  console.log(`[gta] AI pick: "${candidates[idx].title}" (${candidates[idx].gameName || 'GTA'}) — ${data.reason ?? 'viral GTA hook'}`);
   return candidates[idx];
 }
 
 async function aiPlanClipAndPackage(cfg, persona, meta, transcriptBlocks, safe, videoUrl) {
-  const maxWords = Math.floor(cfg.script_seconds * WPS);
-  const maxAllowedStart = Math.max(safe.start, safe.end - cfg.script_seconds);
+  const gameLabel = meta.gameName || 'GTA 6';
+  const isShortClip = safe.marginApplied === 0 && meta.duration <= 65;
+  const targetSecs = Math.min(cfg.script_seconds, Math.max(12, Math.floor((safe.end - safe.start) - 1)));
+  const maxWords = Math.floor(targetSecs * WPS);
+  const maxAllowedStart = isShortClip ? safe.start : Math.max(safe.start, safe.end - targetSecs);
   const extra = cfg.prompt ? `\nCreator Extra Instructions: ${cfg.prompt}\n` : '';
 
   const heatmapBlock = meta.heatmap?.length
@@ -628,60 +638,74 @@ async function aiPlanClipAndPackage(cfg, persona, meta, transcriptBlocks, safe, 
     : '(none)';
   const transcriptText = formatTranscriptForPrompt(transcriptBlocks);
 
-  const prompt = `You are a viral gaming short-form creator turning a GTA 6 video moment into a trendy, hook-worthy 9:16 YouTube Short & Instagram Reel with AI voiceover.
+  const isGta6 = /vi\b|6\b/i.test(gameLabel);
+  const defaultYtTags = isGta6
+    ? '["gta 6", "gta 6 gameplay", "gta vi", "rockstar games", "gta 6 clips", "vice city"]'
+    : '["gta 5", "gta rp", "gta clips", "rockstar games", "gaming clips", "twitch clips"]';
+  const defaultYtHash = isGta6
+    ? '["#Shorts", "#GTA6", "#GTAVI", "#GrandTheftAuto6", "#RockstarGames", "#Gaming"]'
+    : '["#Shorts", "#GTA5", "#GTAV", "#GTARP", "#RockstarGames", "#Gaming"]';
+  const defaultIgHash = isGta6
+    ? '["#reels", "#gta6", "#gtavi", "#grandtheftauto", "#rockstargames", "#gaming", "#gtaclips", "#vicecity"]'
+    : '["#reels", "#gta5", "#gtav", "#gtarp", "#rockstargames", "#gaming", "#gtaclips", "#twitchclips"]';
+
+  const windowRule = isShortClip
+    ? `This is a pre-cut ${meta.duration.toFixed(1)}s Twitch highlight clip. Set clip_start to 0 so the entire viral moment plays.`
+    : `clip_start MUST be between ${Math.round(safe.start)}s (${fmtTime(safe.start)}) and ${Math.round(maxAllowedStart)}s (${fmtTime(maxAllowedStart)}).`;
+
+  const prompt = `You are a viral gaming short-form creator turning a ${gameLabel} gameplay moment into a trendy, hook-worthy 9:16 YouTube Short & Instagram Reel with AI voiceover.
 
 === CREATOR PERSONA & VOICE (FOLLOW STRICTLY) ===
 ${persona}
 
-=== SOURCE GTA 6 VIDEO ===
+=== SOURCE ${gameLabel.toUpperCase()} CLIP ===
+Game: ${gameLabel}
 Title: ${meta.title}
-Channel: ${meta.channel || 'unknown'}
+Creator/Channel: ${meta.channel || 'unknown'}
 Total Duration: ${meta.duration.toFixed(1)}s
 URL: ${videoUrl}
 Description:
 ${meta.description || '(none)'}
 
-=== ALLOWED CLIP WINDOW (STRICT — DO NOT PICK INTRO/OUTRO) ===
-clip_start MUST be between ${Math.round(safe.start)}s (${fmtTime(safe.start)}) and ${Math.round(maxAllowedStart)}s (${fmtTime(maxAllowedStart)}).
-(The first ${safe.marginApplied}s and last ${safe.marginApplied}s are strictly excluded to avoid intros & outros.)
+=== ALLOWED CLIP WINDOW ===
+${windowRule}
 
-=== CHAPTERS INSIDE SAFE WINDOW ===
+=== CHAPTERS ===
 ${chaptersBlock}
 
-=== MOST-REPLAYED PEAKS INSIDE SAFE WINDOW ===
+=== MOST-REPLAYED PEAKS ===
 ${heatmapBlock}
 
-=== TIMESTAMPED TRANSCRIPT INSIDE SAFE WINDOW ===
+=== TIMESTAMPED TRANSCRIPT ===
 ${transcriptText}
 
 === INSTRUCTIONS ===
-1. Read the timestamped transcript, chapters, and Most-Replayed peaks above to find the SINGLE most viral, cool, or surprising GTA 6 moment inside [${Math.round(safe.start)}s, ${Math.round(maxAllowedStart)}s].
-2. Set clip_start (seconds) to the exact start of that moment (MUST be >= ${Math.round(safe.start)} and <= ${Math.round(maxAllowedStart)}).
-3. Write a punchy spoken AI voiceover script explaining WHAT ACTUALLY HAPPENS at that exact timestamp:
-   - Sentence 1 MUST be a scroll-stopping hook ("Rockstar really hid this inside GTA 6...", "Wait until you hear what happens right here in GTA 6...", "Nobody noticed this insane GTA 6 moment...", etc.).
-   - Ground the narration in the real details from that timestamp in the transcript/chapters.
+1. Set clip_start (seconds) inside [${Math.round(safe.start)}, ${Math.round(maxAllowedStart)}].
+2. Write a punchy spoken AI voiceover script reacting to WHAT ACTUALLY HAPPENS in this ${gameLabel} clip:
+   - Sentence 1 MUST be a scroll-stopping hook.
+   - Ground the narration in the real details from the clip title and transcript above. Never call a GTA V clip "GTA 6".
    - Plain spoken English ONLY for TTS: NO markdown, NO emojis, NO hashtags, NO stage directions, NEVER read URLs aloud.
-   - HARD LENGTH CAP: at most ${maxWords} words (under ${cfg.script_seconds} seconds when spoken, target ${Math.floor(maxWords * 0.85)} words).
+   - HARD LENGTH CAP: at most ${maxWords} words (MUST finish in under ${targetSecs} seconds when spoken, target ${Math.floor(maxWords * 0.82)} words).
    - End with a short comment-driving question.${extra}
-4. Generate viral titles, descriptions, and accurate, high-reach GTA 6 hashtags for YouTube Shorts AND Instagram Reels.
+3. Generate viral titles, descriptions, and accurate ${gameLabel} hashtags for YouTube Shorts AND Instagram Reels.
 
 Return ONLY valid JSON:
 {
   "slug": "short_kebab_case_filename_slug",
   "clip_start": ${Math.round(safe.start)},
-  "clip_reason": "What happens at this exact timestamp and why it hooks viewers",
+  "clip_reason": "What happens in this clip and why it hooks viewers",
   "script": "The plain spoken voiceover script under ${maxWords} words...",
   "youtube": {
-    "title": "Viral GTA 6 curiosity-gap title under 70 chars",
-    "description": "2-3 punchy lines matching the persona. Gameplay credit: ${meta.channel || 'source'} (${videoUrl})",
-    "tags": ["gta 6", "gta 6 gameplay", "gta vi", "rockstar games", "gta 6 details", "gta 6 clips", "vice city"],
-    "hashtags": ["#Shorts", "#GTA6", "#GTAVI", "#GrandTheftAuto6", "#RockstarGames", "#Gaming"],
+    "title": "Viral ${gameLabel} curiosity-gap title under 70 chars",
+    "description": "2-3 punchy lines matching the persona. Clip credit: ${meta.channel || 'source'} (${videoUrl})",
+    "tags": ${defaultYtTags},
+    "hashtags": ${defaultYtHash},
     "category": "gaming"
   },
   "instagram": {
-    "title": "Scroll-stopping first-line GTA 6 hook",
-    "description": "2-3 punchy lines about this GTA 6 moment + a question to spark comments.",
-    "hashtags": ["#reels", "#gta6", "#gtavi", "#grandtheftauto", "#rockstargames", "#gaming", "#gtaclips", "#vicecity", "#gamer"]
+    "title": "Scroll-stopping first-line ${gameLabel} hook",
+    "description": "2-3 punchy lines about this ${gameLabel} moment + a question to spark comments.",
+    "hashtags": ${defaultIgHash}
   }
 }`;
 
@@ -720,29 +744,32 @@ export async function runGtaFlow(cfg, g, work) {
   const maxVideoSec = g.gta_max_video ?? 2400;
   const trimMargin = g.gta_trim_margin ?? DEFAULT_TRIM_MARGIN;
 
-  console.log(`[gta] mode: 9:16 GTA 6 clip | fit: ${fit} | trim guard: ±${trimMargin}s | game audio: ${(gameAudioGain * 100).toFixed(0)}% | publish: ${g.publish}`);
+  const twitchClipUrlSlug = g.gta_url ? extractTwitchClipSlug(g.gta_url) : null;
+  const useTwitch = Boolean(twitchClipUrlSlug) || (!g.gta_file && !g.gta_url && hasTwitchCredentials());
+
+  console.log(
+    `[gta] mode: 9:16 GTA clip | source: ${g.gta_file ? 'local' : (useTwitch ? 'twitch-helix' : 'youtube')} | ` +
+    `fit: ${fit} | game audio: ${(gameAudioGain * 100).toFixed(0)}% | publish: ${g.publish}`
+  );
 
   let ytdlp = null;
-  if (!g.gta_file) {
+  if (!g.gta_file && !useTwitch) {
     ytdlp = findYtDlp(g.yt_dlp_path);
     if (!ytdlp) {
       die(
-        'yt-dlp not found (needed to pull YouTube MP4 streams without ffmpeg).\n' +
-        '  Install once:\n' +
-        '    Windows: winget install yt-dlp.yt-dlp   (or drop yt-dlp.exe next to main.js)\n' +
-        '    macOS  : brew install yt-dlp\n' +
-        '    Linux  : pip install yt-dlp\n' +
-        '  Or clip a local file directly:  --gta --gta-file <path/to/video.mp4>'
+        'No clip backend configured: set TWITCH_CLIENT_ID + TWITCH_CLIENT_SECRET (recommended for CI), ' +
+        'install yt-dlp for YouTube, or pass --gta-file <path/to/video.mp4>.'
       );
     }
   }
 
-  // 1) Pick the video & 2) Resolve stream + metadata (with automatic candidate failover)
+  // 1) Pick & download/resolve the source clip
   const history = loadHistory();
   let chosen = null;
   let resolved = null;
-  let meta = { title: '', channel: '', duration: 0, description: '', heatmap: [], chapters: [] };
+  let meta = { title: '', channel: '', gameName: 'GTA 6', duration: 0, description: '', heatmap: [], chapters: [] };
   let videoFormat = null, audioFormat = null;
+  let isTwitchClip = false;
 
   if (g.gta_file) {
     const abs = path.resolve(g.gta_file);
@@ -750,14 +777,69 @@ export async function runGtaFlow(cfg, g, work) {
     chosen = { localFile: abs, url: `file://${abs}`, id: 'local', title: path.basename(abs, path.extname(abs)), channel: 'local', duration: 0 };
     const { probeMedia } = await import('./utils.js');
     const pm = await probeMedia(chosen.localFile);
-    meta = { title: chosen.title, channel: chosen.channel, duration: pm.duration || 60, description: '', heatmap: [], chapters: [] };
+    meta = { title: chosen.title, channel: chosen.channel, gameName: 'GTA 6', duration: pm.duration || 60, description: '', heatmap: [], chapters: [] };
+  } else if (twitchClipUrlSlug) {
+    isTwitchClip = true;
+    const dlPath = path.join(work, `twitch_${twitchClipUrlSlug}.mp4`);
+    await downloadTwitchClip(twitchClipUrlSlug, dlPath);
+    const { probeMedia } = await import('./utils.js');
+    const pm = await probeMedia(dlPath);
+    chosen = {
+      localFile: dlPath,
+      url: canonicalTwitchClipUrl(twitchClipUrlSlug),
+      id: twitchClipUrlSlug,
+      title: `Twitch GTA Clip ${twitchClipUrlSlug}`,
+      channel: 'Twitch',
+      gameName: 'GTA 6',
+      duration: pm.duration || 30,
+    };
+    meta = { title: chosen.title, channel: chosen.channel, gameName: chosen.gameName, duration: chosen.duration, description: '', heatmap: [], chapters: [] };
+  } else if (useTwitch) {
+    isTwitchClip = true;
+    const candidates = await fetchTrendingGtaClips({
+      history,
+      pickRandom: Boolean(g.random),
+    });
+    if (!candidates.length) {
+      die('no fresh Twitch GTA clips found (all trending clips are already in output/history.json).');
+    }
+    console.log(`[twitch] found ${candidates.length} fresh viral GTA clip(s)`);
+    const topPick = await aiPickVideo(cfg, persona, candidates);
+    const queue = [topPick, ...candidates.filter((c) => c.id !== topPick.id)].slice(0, 4);
+
+    const { probeMedia } = await import('./utils.js');
+    let lastErr = null;
+    for (const cand of queue) {
+      const dlPath = path.join(work, `twitch_${cand.id}.mp4`);
+      try {
+        console.log(`[twitch] downloading clip: "${cand.title}" (${cand.channel}, ${cand.views}, ${cand.duration}s)`);
+        await downloadTwitchClip(cand.id, dlPath);
+        const pm = await probeMedia(dlPath);
+        if (!pm?.video) throw new Error('downloaded Twitch MP4 has no readable video track');
+        chosen = { ...cand, localFile: dlPath, duration: pm.duration || cand.duration };
+        meta = {
+          title: cand.title,
+          channel: cand.channel,
+          gameName: cand.gameName,
+          duration: chosen.duration,
+          description: `Viral ${cand.gameName} clip by ${cand.channel} (${cand.views})`,
+          heatmap: [],
+          chapters: [],
+        };
+        break;
+      } catch (e) {
+        lastErr = e;
+        console.log(`[twitch] failed to download ${cand.id} (${String(e?.message ?? e).split('\n')[0]}), trying next clip...`);
+      }
+    }
+    if (!chosen) throw lastErr ?? new Error('could not download any candidate Twitch GTA clip');
   } else if (g.gta_url) {
     const id = extractVideoId(g.gta_url);
-    if (!id) die(`--gta-url is not a valid YouTube video URL: ${g.gta_url}`);
+    if (!id) die(`--gta-url is not a valid YouTube or Twitch clip URL: ${g.gta_url}`);
     chosen = { id, url: canonicalYtUrl(id), title: g.gta_url, channel: '', duration: 0 };
     console.log(`[gta] fetching stream, captions & highlight metadata for ${chosen.url}`);
     resolved = await resolveYtVideo(ytdlp, chosen.url);
-    meta = { title: resolved.title, channel: resolved.channel, duration: resolved.duration, description: resolved.description, heatmap: [], chapters: [] };
+    meta = { title: resolved.title, channel: resolved.channel, gameName: 'GTA 6', duration: resolved.duration, description: resolved.description, heatmap: [], chapters: [] };
     videoFormat = resolved.videoFormat;
     audioFormat = resolved.audioFormat;
   } else {
@@ -778,7 +860,7 @@ export async function runGtaFlow(cfg, g, work) {
       try {
         resolved = await resolveYtVideo(ytdlp, cand.url);
         chosen = cand;
-        meta = { title: resolved.title, channel: resolved.channel, duration: resolved.duration, description: resolved.description, heatmap: [], chapters: [] };
+        meta = { title: resolved.title, channel: resolved.channel, gameName: 'GTA 6', duration: resolved.duration, description: resolved.description, heatmap: [], chapters: [] };
         videoFormat = resolved.videoFormat;
         audioFormat = resolved.audioFormat;
         break;
@@ -790,12 +872,20 @@ export async function runGtaFlow(cfg, g, work) {
     if (!resolved) throw lastErr ?? new Error('could not resolve any candidate GTA 6 video');
   }
 
-  // 3) Compute safe clip window (skips first 2 min & last 2 min)
-  const safe = computeSafeWindow(meta.duration, cfg.script_seconds, trimMargin);
-  console.log(
-    `[gta] safe clip window: ${fmtTime(safe.start)} -> ${fmtTime(safe.end)} of ${fmtTime(meta.duration)}` +
-    (safe.scaled ? ` (video shorter than ${fmtTime(trimMargin * 2 + cfg.script_seconds)}; scaled margin to ±${safe.marginApplied}s)` : ' (first 2m & last 2m excluded)')
-  );
+  // 3) Compute safe clip window (Twitch clips are already pre-cut highlights -> use full 0..duration)
+  let safe;
+  if (isTwitchClip) {
+    safe = { start: 0, end: meta.duration, marginApplied: 0, scaled: false };
+    // Ensure TTS script never exceeds the Twitch clip's duration
+    cfg.script_seconds = Math.min(cfg.script_seconds, Math.max(12, Math.floor(meta.duration - 1)));
+    console.log(`[twitch] full highlight clip window: 00:00 -> ${fmtTime(meta.duration)} (script capped at ${cfg.script_seconds}s)`);
+  } else {
+    safe = computeSafeWindow(meta.duration, cfg.script_seconds, trimMargin);
+    console.log(
+      `[gta] safe clip window: ${fmtTime(safe.start)} -> ${fmtTime(safe.end)} of ${fmtTime(meta.duration)}` +
+      (safe.scaled ? ` (video shorter than ${fmtTime(trimMargin * 2 + cfg.script_seconds)}; scaled margin to ±${safe.marginApplied}s)` : ' (first 2m & last 2m excluded)')
+    );
+  }
 
   if (resolved) {
     // Keep only heatmap peaks and chapters strictly inside [safe.start, safe.end]
