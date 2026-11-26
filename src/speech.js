@@ -1,6 +1,6 @@
 // speech.js - AI script (Gemini) -> TTS (phonon-tts wasm, on-device) -> ASR (phonon-2-web, word timestamps).
 import fs from 'node:fs';
-import { Word, ensureFont } from './captions.js';
+import { Word, ensureFont, alignWordsWithScript } from './captions.js';
 import { checkLlm, llm } from './gemini.js';
 import { TinyVocaTTS, readWav } from './tts.js';
 import * as asr from './asr.js';
@@ -154,8 +154,9 @@ export async function narration(cfg, wav) {
   }
   if (!cfg.captions) return { script, secs, words: [] };
   await ensureFont(cfg.cap_font); // make sure Anton is on disk before the encoder burns captions
-  words = await transcribe(cfg, wav);
-  if (!words.length) throw new Error('ASR found no speech in the generated audio');
-  console.log(`[asr] ${words.length} words timed`);
+  const rawWords = await transcribe(cfg, wav);
+  if (!rawWords.length) throw new Error('ASR found no speech in the generated audio');
+  words = alignWordsWithScript(script, rawWords, secs);
+  console.log(`[asr] ${rawWords.length} ASR words aligned to ${words.length} script words (exact spelling preserved)`);
   return { script, secs, words };
 }
