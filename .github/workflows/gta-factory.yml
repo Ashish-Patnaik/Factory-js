@@ -2,7 +2,7 @@ name: GTA AI Shorts Factory (Twitch Clips)
 
 on:
   schedule:
-    # - cron: '7 7 * * *'   # 12:37 PM IST
+    - cron: '7 7 * * *'   # 12:37 PM IST
     # - cron: '30 13 * * *' # 7:00 PM IST
     # - cron: '30 17 * * *'  # 11:00 PM IST
   workflow_dispatch:
